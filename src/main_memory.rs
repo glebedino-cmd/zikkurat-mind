@@ -4,6 +4,8 @@ mod totems;
 mod utils;
 
 use crate::logos::tokenizer::TokenOutputStream;
+use crate::priests::embeddings::EmbeddingEngine;
+use crate::totems::DialogueManager;
 use crate::utils::hub_load_safetensors;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::layer::SubscriberExt;
@@ -101,7 +103,7 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
+    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<String> {
         use std::io::Write;
         self.tokenizer.clear();
         let mut tokens = self
@@ -124,6 +126,8 @@ impl TextGeneration {
             None => anyhow::bail!("cannot find the </s> token"),
         };
         let start_gen = std::time::Instant::now();
+        let mut output_tokens = Vec::new();
+
         for index in 0..sample_len {
             let context_size = if index > 0 { 1 } else { tokens.len() };
             let start_pos = tokens.len().saturating_sub(context_size);
@@ -147,6 +151,7 @@ impl TextGeneration {
 
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
+            output_tokens.push(next_token);
             generated_tokens += 1;
             if next_token == eos_token {
                 break;
@@ -156,6 +161,7 @@ impl TextGeneration {
                 std::io::stdout().flush()?;
             }
         }
+
         let dt = start_gen.elapsed();
         if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
             print!("{rest}");
@@ -165,7 +171,15 @@ impl TextGeneration {
             "\n{generated_tokens} tokens generated ({:.2} token/s)",
             generated_tokens as f64 / dt.as_secs_f64(),
         );
-        Ok(())
+
+        // Декодируем сгенерированный текст
+        let generated_text = self
+            .tokenizer
+            .tokenizer()
+            .decode(&output_tokens, true)
+            .map_err(E::msg)?;
+
+        Ok(generated_text)
     }
 }
 
@@ -338,6 +352,35 @@ fn merge_config_with_args(config: MistralConfig, args: &Args) -> MistralConfig {
     }
 }
 
+/// Создает расширенный промпт с контекстом памяти
+fn create_enhanced_prompt(
+    user_input: &str,
+    memory_context: Option<&str>,
+    current_dialogue: Option<&str>,
+) -> String {
+    let mut prompt_parts = Vec::new();
+
+    // Добавляем контекст памяти если доступен
+    if let Some(context) = memory_context {
+        if !context.is_empty() {
+            prompt_parts.push(format!("=== Relevant Past Dialogues ===\n{}", context));
+        }
+    }
+
+    // Добавляем текущий диалог
+    if let Some(dialogue) = current_dialogue {
+        if !dialogue.is_empty() {
+            prompt_parts.push(format!("=== Current Dialogue ===\n{}", dialogue));
+        }
+    }
+
+    // Добавляем текущий ввод
+    prompt_parts.push(format!("=== User Input ===\n{}", user_input));
+    prompt_parts.push("=== Assistant Response ===".to_string());
+
+    prompt_parts.join("\n\n")
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -356,11 +399,11 @@ fn main() -> Result<()> {
     }
 
     // Check if prompt is provided for main functionality
-    let prompt = if let Some(ref p) = args.prompt {
+    let user_input = if let Some(ref p) = args.prompt {
         p.clone()
     } else {
         eprintln!(
-            "Error: --prompt <PROMPT> is required when not using --show-config or --save-config"
+            "Error: --prompt <PROMPT> is required when not using --show-config or --save_config"
         );
         std::process::exit(1);
     };
@@ -399,6 +442,41 @@ fn main() -> Result<()> {
         effective_config.repeat_penalty.unwrap_or(1.1),
         effective_config.repeat_last_n.unwrap_or(64)
     );
+
+    // Инициализация памяти (если включена)
+    let mut dialogue_manager = if args.enable_memory {
+        println!("🧠 Initializing memory system...");
+        let device = crate::priests::device::select_device(args.cpu)?;
+
+        // Проверяем наличие модели эмбеддингов
+        let embedding_path = Path::new(&args.embedding_model);
+        if !embedding_path.exists() {
+            println!(
+                "⚠️  Warning: Embedding model not found at {}. Memory will be disabled.",
+                args.embedding_model
+            );
+            None
+        } else {
+            match EmbeddingEngine::new(&args.embedding_model, device) {
+                Ok(embedder) => {
+                    println!("✅ Memory system initialized");
+                    Some(DialogueManager::new(
+                        Arc::new(embedder),
+                        args.persona.clone(),
+                    ))
+                }
+                Err(e) => {
+                    println!(
+                        "⚠️  Failed to initialize memory: {}. Memory will be disabled.",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
 
     let start = std::time::Instant::now();
     let api = Api::new()?;
@@ -492,6 +570,77 @@ fn main() -> Result<()> {
         effective_config.repeat_last_n.unwrap_or(64),
         &device,
     );
-    pipeline.run(&prompt, args.sample_len)?;
+
+    // === Memory Integration ===
+    let mut memory_context = String::new();
+    let mut current_dialogue_context = String::new();
+
+    // Получаем контекст из памяти если она доступна
+    if let (Some(ref mut manager), true) = (
+        &mut dialogue_manager,
+        args.enable_memory && args.memory_context_count > 0,
+    ) {
+        // Ищем похожие диалоги
+        match manager.find_similar_dialogues(&user_input, args.memory_context_count) {
+            Ok(similar_dialogues) => {
+                if !similar_dialogues.is_empty() {
+                    memory_context = similar_dialogues.join("\n");
+                    println!(
+                        "🧠 Found {} relevant dialogues from memory",
+                        similar_dialogues.len()
+                    );
+                }
+            }
+            Err(e) => {
+                println!("⚠️  Memory search failed: {}", e);
+            }
+        }
+
+        // Получаем текущий контекст диалога
+        current_dialogue_context = manager.get_current_context(3);
+    }
+
+    // Создаем улучшенный промпт
+    let enhanced_prompt = create_enhanced_prompt(
+        &user_input,
+        if memory_context.is_empty() {
+            None
+        } else {
+            Some(&memory_context)
+        },
+        if current_dialogue_context.is_empty() {
+            None
+        } else {
+            Some(&current_dialogue_context)
+        },
+    );
+
+    // Показываем контекст памяти (для отладки)
+    if args.enable_memory && !memory_context.is_empty() {
+        println!("\n=== Memory Context ===");
+        println!("{}", memory_context);
+        println!("===================\n");
+    }
+
+    // Генерируем ответ
+    println!("🤖 Assistant:");
+    let response = pipeline.run(&enhanced_prompt, args.sample_len)?;
+
+    // Сохраняем диалог в память
+    if let (Some(ref mut manager), true) = (&mut dialogue_manager, args.enable_memory) {
+        match manager.add_exchange(user_input.clone(), response.clone()) {
+            Ok(()) => {
+                println!("💾 Dialogue saved to memory");
+
+                // Показываем статистику памяти
+                let stats = manager.stats();
+                println!("{}", stats.format());
+            }
+            Err(e) => {
+                println!("⚠️  Failed to save dialogue to memory: {}", e);
+            }
+        }
+    }
+
     Ok(())
 }

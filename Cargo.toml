@@ -67,3 +67,7 @@ mkl = [
 [[bin]]
 name = "mistral-pure"
 path = "src/main.rs"
+
+[[bin]]
+name = "ziggurat-mind"
+path = "src/main_memory.rs"
