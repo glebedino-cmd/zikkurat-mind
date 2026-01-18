@@ -298,7 +298,7 @@ impl DeviceManager {
                 let used = total - Self::get_available_system_memory_mb();
                 Ok((used, total))
             }
-            DeviceType::Cuda { device_id: _, .. } => {
+            DeviceType::Cuda { device_id, .. } => {
                 #[cfg(feature = "cuda")]
                 {
                     Self::get_cuda_memory_usage(*device_id)
