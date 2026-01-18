@@ -90,8 +90,8 @@ impl UnifiedMemoryManager {
 
         let context = MemoryContext {
             current_dialogue,
-            relevant_episodes,
-            relevant_concepts,
+            relevant_episodes: relevant_episodes.clone(),
+            relevant_concepts: relevant_concepts.clone(),
             search_stats: SearchStats {
                 episodes_found: relevant_episodes.len(),
                 concepts_found: relevant_concepts.len(),

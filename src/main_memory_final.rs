@@ -636,22 +636,23 @@ fn main() -> Result<()> {
             args.memory_concepts_count,
         ) {
             Ok(context) => {
+                let context_clone = context.clone();
                 memory_context = Some(context);
 
                 // Показываем статистику поиска
                 println!("\n🔍 Memory Search Results:");
                 println!(
                     "   📝 Episodes found: {}",
-                    context.search_stats.episodes_found
+                    context_clone.search_stats.episodes_found
                 );
                 println!(
                     "   🧠 Concepts found: {}",
-                    context.search_stats.concepts_found
+                    context_clone.search_stats.concepts_found
                 );
                 println!(
                     "   ⏱️  Total search time: {}ms",
-                    context.search_stats.episode_search_time_ms
-                        + context.search_stats.concept_search_time_ms
+                    context_clone.search_stats.episode_search_time_ms
+                        + context_clone.search_stats.concept_search_time_ms
                 );
             }
             Err(e) => {
@@ -667,8 +668,10 @@ fn main() -> Result<()> {
     if args.enable_memory {
         if let Some(ref context) = memory_context {
             println!("\n=== 🧠 Memory Context ===");
-            let formatted = memory_manager.format_context_for_prompt(context);
-            println!("{}", formatted);
+            if let Some(ref memory_manager) = memory {
+                let formatted = memory_manager.format_context_for_prompt(context);
+                println!("{}", formatted);
+            }
             println!("=======================\n");
         }
     }

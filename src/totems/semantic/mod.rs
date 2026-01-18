@@ -448,6 +448,11 @@ impl SemanticMemory {
         }
     }
 
+    /// Возвращает все концепты
+    pub fn get_all_concepts(&self) -> Vec<Concept> {
+        self.concepts.values().cloned().collect()
+    }
+
     /// Очищает старые концепты
     pub fn cleanup_old_concepts(&mut self, before: chrono::DateTime<chrono::Utc>) -> usize {
         let mut removed = 0;
