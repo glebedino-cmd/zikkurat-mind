@@ -1,0 +1,10 @@
+C:\Users\zikkuratti\Documents\agent\zikkurat-mind\target\release\deps\safetensors-84a4d6997e3103fb.d: C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\lib.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\slice.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\tensor.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\../README.md
+
+C:\Users\zikkuratti\Documents\agent\zikkurat-mind\target\release\deps\libsafetensors-84a4d6997e3103fb.rlib: C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\lib.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\slice.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\tensor.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\../README.md
+
+C:\Users\zikkuratti\Documents\agent\zikkurat-mind\target\release\deps\libsafetensors-84a4d6997e3103fb.rmeta: C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\lib.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\slice.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\tensor.rs C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\../README.md
+
+C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\lib.rs:
+C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\slice.rs:
+C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\tensor.rs:
+C:\Users\zikkuratti\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\safetensors-0.6.2\src\../README.md:
