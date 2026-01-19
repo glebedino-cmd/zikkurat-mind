@@ -4,7 +4,7 @@ mod totems;
 mod utils;
 
 use crate::logos::tokenizer::TokenOutputStream;
-use crate::priests::embeddings::EmbeddingEngine;
+use crate::priests::{dummy_embeddings::DummyEmbeddingEngine, embeddings::EmbeddingEngine};
 use crate::totems::{PersistenceFormat, PersistenceManager, UnifiedMemoryManager};
 use crate::utils::hub_load_safetensors;
 use tracing_chrome::ChromeLayerBuilder;
@@ -268,7 +268,7 @@ struct Args {
     quantized: bool,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
-    #[arg(long, default_value_t = 1.1)]
+    #[arg(long, default_value_t = 1.3)]
     repeat_penalty: f32,
 
     /// The context size to consider for repeat penalty.
@@ -418,7 +418,7 @@ fn create_enhanced_prompt(
 
     // Добавляем текущий ввод
     prompt_parts.push(format!("=== User Input ===\n{}", user_input));
-    prompt_parts.push("=== Assistant Response ===".to_string());
+    // Не добавляем заголовок Assistant Response - модель сама сгенерирует ответ
 
     prompt_parts.join("\n\n")
 }
@@ -511,21 +511,45 @@ fn main() -> Result<()> {
 
         // Проверяем наличие модели эмбеддингов
         let device = crate::priests::device::select_device(args.cpu)?;
-        match EmbeddingEngine::new(&args.embedding_model, device) {
+
+        // Проверяем наличие файлов модели перед загрузкой
+        let embedding_path = std::path::Path::new(&args.embedding_model);
+        let config_path = embedding_path.join("config.json");
+        let has_models = embedding_path.exists() && config_path.exists();
+
+        // Сначала пробуем реальные модели эмбеддингов, если они есть
+        let embedder_result = if has_models {
+            EmbeddingEngine::new(&args.embedding_model, device.clone())
+        } else {
+            Err(anyhow::anyhow!("Embedding models not found"))
+        };
+
+        let memory_manager = match embedder_result {
             Ok(embedder) => {
-                let memory_manager =
-                    UnifiedMemoryManager::new(Arc::new(embedder), args.persona.clone());
-                println!("✅ Memory system initialized");
-                Some(memory_manager)
+                println!("✅ Real embedding models loaded");
+                UnifiedMemoryManager::new(Arc::new(embedder), args.persona.clone())
             }
-            Err(e) => {
-                println!(
-                    "⚠️  Failed to initialize memory: {}. Memory will be disabled.",
-                    e
-                );
-                None
+            Err(_) => {
+                if !has_models {
+                    println!("⚠️  Embedding models not found, using dummy embeddings");
+                    println!("   Memory system will work with limited functionality");
+                    println!(
+                        "   For full functionality, download models to: {}",
+                        args.embedding_model
+                    );
+                } else {
+                    println!("⚠️  Failed to load embedding models, using dummy embeddings");
+                    println!("   Memory system will work with limited functionality");
+                }
+
+                // Используем dummy embeddings как fallback
+                let dummy = DummyEmbeddingEngine::new(device, 384); // 384 = e5-small dim
+                UnifiedMemoryManager::new(Arc::new(dummy), args.persona.clone())
             }
-        }
+        };
+
+        println!("✅ Memory system initialized");
+        Some(memory_manager)
     } else {
         None
     };

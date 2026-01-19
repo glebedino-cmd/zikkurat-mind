@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::priests::embeddings::EmbeddingEngine;
+use crate::priests::embeddings::{Embedder, EmbeddingEngine};
 use crate::totems::{
     episodic::{DialogueManager, DialogueManagerStats},
     retrieval::{MemoryEntry, MemoryType, VectorStore},
@@ -21,6 +21,8 @@ pub struct UnifiedMemoryManager {
     pub semantic: SemanticMemory,
     /// Объединенное векторное хранилище (для оптимизации)
     unified_vector_store: VectorStore,
+    /// Эмбеддинг движок (может быть реальным или dummy)
+    embedder: Arc<dyn Embedder>,
 }
 
 /// Контекст памяти для генерации
@@ -51,13 +53,14 @@ pub struct SearchStats {
 
 impl UnifiedMemoryManager {
     /// Создает новый унифицированный менеджер памяти
-    pub fn new(embedder: Arc<EmbeddingEngine>, persona_name: String) -> Self {
+    pub fn new(embedder: Arc<dyn Embedder>, persona_name: String) -> Self {
         let dimension = embedder.embedding_dim();
 
         Self {
             episodic: DialogueManager::new(embedder.clone(), persona_name),
-            semantic: SemanticMemory::new(embedder),
+            semantic: SemanticMemory::new(embedder.clone()),
             unified_vector_store: VectorStore::new(dimension),
+            embedder,
         }
     }
 

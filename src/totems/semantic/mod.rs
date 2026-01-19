@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::priests::embeddings::EmbeddingEngine;
+use crate::priests::embeddings::Embedder;
 use crate::totems::retrieval::{MemoryEntry, MemoryType, VectorStore};
 
 /// Концепт или знание в семантической памяти
@@ -55,7 +55,7 @@ pub struct SemanticMemory {
     /// Векторное хранилище для быстрого поиска концептов
     vector_store: VectorStore,
     /// Эмбеддинг движок
-    embedder: Arc<EmbeddingEngine>,
+    embedder: Arc<dyn Embedder>,
     /// Индекс концептов по имени для быстрого доступа
     concept_index: HashMap<String, Uuid>,
     /// Хранилище концептов
@@ -92,7 +92,7 @@ impl Default for ExtractionStats {
 
 impl SemanticMemory {
     /// Создает новую семантическую память
-    pub fn new(embedder: Arc<EmbeddingEngine>) -> Self {
+    pub fn new(embedder: Arc<dyn Embedder>) -> Self {
         let dimension = embedder.embedding_dim();
         Self {
             vector_store: VectorStore::new(dimension),

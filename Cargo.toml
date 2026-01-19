@@ -6,10 +6,10 @@ description = "mistral-pure using Candle"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Candle dependencies - using official HuggingFace candle (updated for better CUDA compatibility)
-candle-core = { git = "https://github.com/huggingface/candle", branch = "main" }
-candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
-candle-transformers = { git = "https://github.com/huggingface/candle", branch = "main" }
+# Candle dependencies - using official HuggingFace candle (reverted to stable version)
+candle-core = { git = "https://github.com/huggingface/candle", rev = "f526033db7ea880c7189628a2dc00e3e2008a9e7" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "f526033db7ea880c7189628a2dc00e3e2008a9e7" }
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "f526033db7ea880c7189628a2dc00e3e2008a9e7" }
 
 # CLI and utilities
 anyhow = "1"

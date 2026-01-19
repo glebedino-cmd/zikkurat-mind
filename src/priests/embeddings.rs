@@ -12,6 +12,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
+/// Trait для эмбеддингов, поддерживает разные реализации
+pub trait Embedder: Send + Sync {
+    fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    fn embedding_dim(&self) -> usize;
+}
+
 /// Конфигурация эмбеддинг движка
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
@@ -333,19 +339,13 @@ impl EmbeddingEngine {
     }
 }
 
-/// Трейт для векторизации текста
-pub trait Embedder {
-    fn embed(&self, text: &str) -> Result<Vec<f32>>;
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-}
-
 impl Embedder for EmbeddingEngine {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.embed(text)
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.embed_batch(texts)
+    fn embedding_dim(&self) -> usize {
+        self.embedding_dim()
     }
 }
 

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::priests::embeddings::EmbeddingEngine;
+use crate::priests::embeddings::Embedder;
 use crate::totems::retrieval::{MemoryEntry, MemoryType, VectorStore};
 
 /// Обмен в диалоге (пользователь - ассистент)
@@ -129,7 +129,7 @@ pub struct DialogueManager {
     /// Векторное хранилище для быстрого поиска
     vector_store: VectorStore,
     /// Эмбеддинг движок
-    embedder: Arc<EmbeddingEngine>,
+    embedder: Arc<dyn Embedder>,
     /// История всех сессий
     session_history: HashMap<Uuid, Session>,
     /// Максимальное количество хранимых сессий
@@ -138,7 +138,7 @@ pub struct DialogueManager {
 
 impl DialogueManager {
     /// Создает новый менеджер диалогов
-    pub fn new(embedder: Arc<EmbeddingEngine>, persona_name: String) -> Self {
+    pub fn new(embedder: Arc<dyn Embedder>, persona_name: String) -> Self {
         let dimension = embedder.embedding_dim();
         Self {
             current_session: Session::new(persona_name),
@@ -151,7 +151,7 @@ impl DialogueManager {
 
     /// Создает с кастомными параметрами
     pub fn with_config(
-        embedder: Arc<EmbeddingEngine>,
+        embedder: Arc<dyn Embedder>,
         persona_name: String,
         max_sessions: usize,
     ) -> Self {

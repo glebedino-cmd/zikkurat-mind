@@ -393,13 +393,12 @@ fn create_enhanced_prompt(
     // Добавляем контекст памяти если доступен
     if let Some(context) = memory_context {
         if !context.relevant_concepts.is_empty() || !context.relevant_episodes.is_empty() {
-            let formatted_context = crate::totems::UnifiedMemoryManager::format_context_for_prompt(
-                &crate::totems::UnifiedMemoryManager::new(
-                    Arc::new(EmbeddingEngine::new("dummy", Device::Cpu)),
-                    "dummy".to_string(),
-                ),
-                context,
+            let dummy_embedder = Arc::new(
+                crate::priests::dummy_embeddings::DummyEmbeddingEngine::new(Device::Cpu, 384),
             );
+            let dummy_memory =
+                crate::totems::UnifiedMemoryManager::new(dummy_embedder, "dummy".to_string());
+            let formatted_context = dummy_memory.format_context_for_prompt(context);
             prompt_parts.push(formatted_context);
             prompt_parts.push(String::new());
         }
@@ -525,33 +524,40 @@ fn main() -> Result<()> {
 
         // Проверяем наличие модели эмбеддингов
         let device = crate::priests::device::select_device(args.cpu)?;
-        match EmbeddingEngine::new(&args.embedding_model, device) {
+        let embedder_result = EmbeddingEngine::new(&args.embedding_model, device.clone());
+
+        let embedder: Arc<dyn crate::priests::embeddings::Embedder> = match embedder_result {
             Ok(embedder) => {
-                let memory_manager =
-                    UnifiedMemoryManager::new(Arc::new(embedder), args.persona.clone());
-
-                // Загружаем существующую память
-                match persistence.load_vector_store(embedder.embedding_dim()) {
-                    Ok(vector_store) => {
-                        // TODO: Загрузить векторное хранилище в память
-                        println!("📥 Loaded existing memory from disk");
-                    }
-                    Err(_) => {
-                        println!("🆕 Starting with fresh memory");
-                    }
-                }
-
-                println!("✅ Memory system initialized");
-                Some(memory_manager)
+                println!("✅ Real embedding model loaded");
+                Arc::new(embedder)
             }
             Err(e) => {
                 println!(
-                    "⚠️  Failed to initialize memory: {}. Memory will be disabled.",
-                    e
+                    "⚠️  Failed to load embedding model from '{}': {}",
+                    args.embedding_model, e
                 );
-                None
+                println!("🔄 Falling back to dummy embedding engine (reduced memory quality)");
+                Arc::new(crate::priests::dummy_embeddings::DummyEmbeddingEngine::new(
+                    device, 384,
+                ))
+            }
+        };
+
+        let memory_manager = UnifiedMemoryManager::new(embedder.clone(), args.persona.clone());
+
+        // Загружаем существующую память
+        match persistence.load_vector_store(embedder.embedding_dim()) {
+            Ok(vector_store) => {
+                // TODO: Загрузить векторное хранилище в память
+                println!("📥 Loaded existing memory from disk");
+            }
+            Err(_) => {
+                println!("🆕 Starting with fresh memory");
             }
         }
+
+        println!("✅ Memory system initialized");
+        Some(memory_manager)
     } else {
         None
     };
@@ -711,10 +717,10 @@ fn main() -> Result<()> {
     if args.enable_memory {
         if let Some(ref context) = memory_context {
             println!("\n=== 🧠 Memory Context ===");
-            let mut dummy_memory = UnifiedMemoryManager::new(
-                Arc::new(EmbeddingEngine::new("dummy", Device::Cpu).unwrap()),
-                "dummy".to_string(),
+            let dummy_embedder = Arc::new(
+                crate::priests::dummy_embeddings::DummyEmbeddingEngine::new(Device::Cpu, 384),
             );
+            let dummy_memory = UnifiedMemoryManager::new(dummy_embedder, "dummy".to_string());
             let formatted = dummy_memory.format_context_for_prompt(&context);
             println!("{}", formatted);
             println!("=======================\n");

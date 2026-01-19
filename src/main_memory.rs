@@ -450,30 +450,35 @@ fn main() -> Result<()> {
 
         // Проверяем наличие модели эмбеддингов
         let embedding_path = Path::new(&args.embedding_model);
-        if !embedding_path.exists() {
-            println!(
-                "⚠️  Warning: Embedding model not found at {}. Memory will be disabled.",
-                args.embedding_model
-            );
-            None
-        } else {
-            match EmbeddingEngine::new(&args.embedding_model, device) {
+        let embedder = if embedding_path.exists() {
+            match EmbeddingEngine::new(&args.embedding_model, device.clone()) {
                 Ok(embedder) => {
-                    println!("✅ Memory system initialized");
-                    Some(DialogueManager::new(
-                        Arc::new(embedder),
-                        args.persona.clone(),
-                    ))
+                    println!("✅ Real embedding model loaded");
+                    Arc::new(embedder) as Arc<dyn crate::priests::embeddings::Embedder>
                 }
                 Err(e) => {
                     println!(
-                        "⚠️  Failed to initialize memory: {}. Memory will be disabled.",
-                        e
+                        "⚠️  Failed to load embedding model from '{}': {}",
+                        args.embedding_model, e
                     );
-                    None
+                    println!("🔄 Falling back to dummy embedding engine");
+                    Arc::new(crate::priests::dummy_embeddings::DummyEmbeddingEngine::new(
+                        device, 384,
+                    )) as Arc<dyn crate::priests::embeddings::Embedder>
                 }
             }
-        }
+        } else {
+            println!(
+                "⚠️  Embedding model not found at '{}'. Using dummy embeddings.",
+                args.embedding_model
+            );
+            Arc::new(crate::priests::dummy_embeddings::DummyEmbeddingEngine::new(
+                device, 384,
+            )) as Arc<dyn crate::priests::embeddings::Embedder>
+        };
+
+        println!("✅ Memory system initialized");
+        Some(DialogueManager::new(embedder, args.persona.clone()))
     } else {
         None
     };
