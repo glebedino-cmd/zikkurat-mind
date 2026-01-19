@@ -73,5 +73,5 @@ name = "ziggurat-mind"
 path = "src/main_memory.rs"
 
 [[bin]]
-name = "ziggurat-enhanced"
-path = "src/main_memory_final.rs"
+name = "ziggurat-unified"
+path = "src/main_unified.rs"

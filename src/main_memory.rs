@@ -5,7 +5,7 @@ mod utils;
 
 use crate::logos::tokenizer::TokenOutputStream;
 use crate::priests::embeddings::EmbeddingEngine;
-use crate::totems::DialogueManager;
+use crate::totems::episodic::DialogueManager;
 use crate::utils::hub_load_safetensors;
 use tracing_chrome::ChromeLayerBuilder;
 use tracing_subscriber::layer::SubscriberExt;
@@ -20,7 +20,6 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 

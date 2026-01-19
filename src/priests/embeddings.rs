@@ -3,6 +3,8 @@
 //! Высокопроизводительный движок векторизации на базе intfloat/multilingual-e5-small
 //! Оптимизирован для RTX 4090 32GB с батчингом и кэшированием
 
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -183,15 +185,16 @@ impl EmbeddingEngine {
             .encode(processed_text.as_str(), true)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
 
-        // Подготовка тензоров
-        let token_ids = Tensor::new(tokens.get_ids(), &self.device)?;
-        let attention_mask = Tensor::new(tokens.get_attention_mask(), &self.device)?;
+        // Подготовка тензоров (2D: batch_size=1, seq_len)
+        let token_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
+        let attention_mask =
+            Tensor::new(tokens.get_attention_mask(), &self.device)?.unsqueeze(0)?;
 
         // Forward pass
         let output = self.model.forward(&token_ids, &attention_mask, None)?;
 
         // Mean pooling для получения эмбеддинга
-        let pooled = output.mean(1)?;
+        let pooled = output.mean(1)?.squeeze(0)?;
         let embedding = if self.config.normalize {
             self.l2_normalize(&pooled.to_vec1()?)?
         } else {

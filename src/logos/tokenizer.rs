@@ -1,4 +1,6 @@
 // TokenOutputStream moved from utils to logos for clean module structure
+#![allow(dead_code)]
+
 use anyhow::Result;
 use tokenizers::Tokenizer;
 

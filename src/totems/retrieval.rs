@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod vector_store;
 
-pub use vector_store::{cosine_similarity, MemoryEntry, MemoryType, VectorStore, VectorStoreStats};
+pub use vector_store::{MemoryEntry, MemoryType, VectorStore, VectorStoreStats};

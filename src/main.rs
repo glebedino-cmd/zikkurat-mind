@@ -18,9 +18,7 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 use candle_transformers::models::mistral::{Config, Model as Mistral};
 use candle_transformers::models::quantized_mistral::Model as QMistral;

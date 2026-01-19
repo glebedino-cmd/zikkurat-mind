@@ -3,7 +3,9 @@
 //! Сохранение и загрузка памяти между запусками
 //! Поддерживает JSON и бинарные форматы
 
-use anyhow::{anyhow, Result};
+#![allow(dead_code)]
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::BufReader;

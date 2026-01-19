@@ -3,6 +3,8 @@
 //! Умное управление GPU/CPU устройствами с мониторингом и оптимизацией
 //! Поддержка CUDA, Metal, и автоматический fallback
 
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result as AnyhowResult};
 use candle_core::Device;
 use serde::{Deserialize, Serialize};
@@ -298,20 +300,27 @@ impl DeviceManager {
                 let used = total - Self::get_available_system_memory_mb();
                 Ok((used, total))
             }
-            DeviceType::Cuda { device_id, .. } => {
+            #[allow(unused_variables)]
+            DeviceType::Cuda {
+                device_id: _device_id,
+                ..
+            } => {
                 #[cfg(feature = "cuda")]
                 {
-                    Self::get_cuda_memory_usage(*device_id)
+                    Self::get_cuda_memory_usage(*_device_id)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
                     Ok((0, 0))
                 }
             }
-            DeviceType::Metal { device_id: _, .. } => {
+            DeviceType::Metal {
+                device_id: _device_id,
+                ..
+            } => {
                 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
                 {
-                    Self::get_metal_memory_usage(*device_id)
+                    Self::get_metal_memory_usage(*_device_id)
                 }
                 #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
                 {

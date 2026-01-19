@@ -3,13 +3,15 @@
 //! Объединяет эпизодическую и семантическую память
 //! Предоставляет единый интерфейс для работы с разными типами памяти
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::priests::embeddings::{Embedder, EmbeddingEngine};
+use crate::priests::embeddings::Embedder;
 use crate::totems::{
     episodic::{DialogueManager, DialogueManagerStats},
-    retrieval::{MemoryEntry, MemoryType, VectorStore},
+    retrieval::VectorStore,
     semantic::{ConceptResult, SemanticMemory, SemanticMemoryStats},
 };
 
@@ -71,7 +73,7 @@ impl UnifiedMemoryManager {
         episodes_count: usize,
         concepts_count: usize,
     ) -> Result<MemoryContext> {
-        let start_time = std::time::Instant::now();
+        let _start_time = std::time::Instant::now();
 
         // 1. Поиск в эпизодической памяти
         let episode_start = std::time::Instant::now();

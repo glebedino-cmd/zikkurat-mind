@@ -3,7 +3,9 @@
 //! Управляет диалоговыми сессиями с автоматической векторизацией
 //! и поиском похожих разговоров из прошлого
 
-use anyhow::{anyhow, Result};
+#![allow(dead_code)]
+
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -176,6 +178,7 @@ impl DialogueManager {
         // Векторизуем объединенный текст
         let context_text = turn.combined_text();
         let embedding = self.embedder.embed(&context_text)?;
+        eprintln!("DEBUG add_exchange: embedding.len() = {}", embedding.len());
 
         // Создаем запись в векторной памяти
         let memory_entry = MemoryEntry::new(
@@ -198,6 +201,10 @@ impl DialogueManager {
 
         // Добавляем в векторное хранилище
         self.vector_store.add(memory_entry)?;
+        eprintln!(
+            "DEBUG add_exchange: vector_store.len() = {}",
+            self.vector_store.len()
+        );
 
         Ok(())
     }

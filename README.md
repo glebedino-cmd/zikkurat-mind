@@ -2,48 +2,57 @@
 
 > **AI с долговременной памятью и сознанием**
 
-MVP версия системы с эпизодической памятью на базе эмбеддингов и векторного поиска.
+## Архитектура
 
-## 🚀 Быстрый старт
-
-### 1. Скачайте модель эмбеддингов:
-```bash
-mkdir -p models/embeddings
-cd models/embeddings
-wget https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/config.json
-wget https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/model.safetensors  
-wget https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/tokenizer.json
+```
+User Input
+    ↓
+Embedding Engine (CUDA) → Vectorize query
+    ↓
+Vector Store → Find similar dialogues
+    ↓
+Dialogue Manager → Get context
+    ↓
+Mistral 7B (CUDA) → Generate response with context
+    ↓
+Memory → Save dialogue
+    ↓
+Response
 ```
 
-### 2. Запустите с памятью:
+## Компоненты
+
+| Компонент | Описание |
+|-----------|----------|
+| **Priests** (Embeddings) | e5-small модель для векторизации |
+| **Totems** (Memory) | Эпизодическая + семантическая память |
+| **Logos** (Reasoning) | Mistral 7B инференс |
+
+## Быстрый старт
+
 ```bash
-cargo run --bin ziggurat-mind -- \
-  --prompt "Расскажи о квантовой запутанности" \
+# Сборка с CUDA
+cargo build --features cuda
+
+# Запуск
+cargo run --bin ziggurat-unified --features cuda -- \
+  --prompt "Привет!" \
   --enable-memory \
-  --memory-context-count 3
+  --interactive
 ```
 
-## 📚 Документация
+## Ключевые файлы
 
-- [📖 MVP Guide](MVP_GUIDE.md) - Полное руководство пользователя
-- [🏗️ Current Architecture](CURRENT_ARCHITECTURE.md) - Техническая архитектура
-- [🎯 Core Philosophy](documentation/CORE_PHILOSOPHY.md) - Философия проекта
+- `src/main_unified.rs` - Единая точка входа
+- `src/priests/embeddings.rs` - Эмбеддинг движок
+- `src/totems/memory.rs` - Менеджер памяти
+- `src/logos/` - Mistral 7B логика
 
-## ✨ Что реализовано
+## Документация
 
-- **🧠 Эпизодическая память** - запоминает все диалоги
-- **🔍 Семантический поиск** - находит похожие разговоры по смыслу  
-- **⚡ Высоко-производительный эмбеддинг** - intfloat/multilingual-e5-small
-- **🤖 Интеграция с Mistral** - контекстуально-осведомленная генерация
-- **📊 Мониторинг** - статистика использования памяти
-
-## 🎯 Ключевые особенности
-
-- **100% Top-5 retrieval accuracy** (по бенчмаркам)
-- **16ms latency** на эмбеддинг
-- **In-memory storage** для максимальной скорости
-- **384 dimensions** оптимальный размер векторов
+- [Core Philosophy](documentation/CORE_PHILOSOPHY.md) - Философия проекта
+- [Current Status](CURRENT_STATUS.md) - Текущее состояние
 
 ---
 
-**Welcome to the next generation of AI assistants! 🚀**
+**ZIGGURAT MIND - Building AI with Memory and Consciousness 🏛️**

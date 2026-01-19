@@ -3,7 +3,9 @@
 //! Управляет извлеченными знаниями, концептами и убеждениями
 //! Автоматически выявляет и структурирует знания из диалогов
 
-use anyhow::{anyhow, Result};
+#![allow(dead_code)]
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -3,8 +3,10 @@
 //! Используется когда модели эмбеддингов недоступны
 //! Возвращает фиктивные векторы для тестирования системы памяти
 
+#![allow(dead_code)]
+
 use crate::priests::embeddings::Embedder;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use candle_core::Device;
 
 /// Фиктивный эмбеддинг движок для тестирования без реальных моделей
