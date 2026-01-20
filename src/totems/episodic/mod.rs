@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod persistence;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -109,15 +111,46 @@ impl Session {
     }
 
     /// Формирует контекст из последних обменов
-    pub fn format_context(&self, max_turns: usize) -> String {
+    pub fn format_context(&self, max_turns: usize, max_chars: usize) -> String {
         let recent_turns = self.last_turns(max_turns);
         let mut context = String::new();
 
         for turn in recent_turns {
-            context.push_str(&format!(
-                "User: {}\nAssistant: {}\n\n",
-                turn.user, turn.assistant
-            ));
+            let user_char_count = turn.user.chars().count();
+            let user = if user_char_count > max_chars / 4 {
+                let byte_pos = turn
+                    .user
+                    .char_indices()
+                    .nth(max_chars / 4)
+                    .unwrap_or((turn.user.len(), ' '))
+                    .0;
+                &turn.user[..byte_pos]
+            } else {
+                &turn.user
+            };
+
+            let assistant_char_count = turn.assistant.chars().count();
+            let assistant = if assistant_char_count > max_chars / 4 {
+                let byte_pos = turn
+                    .assistant
+                    .char_indices()
+                    .nth(max_chars / 4)
+                    .unwrap_or((turn.assistant.len(), ' '))
+                    .0;
+                &turn.assistant[..byte_pos]
+            } else {
+                &turn.assistant
+            };
+            context.push_str(&format!("User: {}\nAssistant: {}\n\n", user, assistant));
+
+            if context.chars().count() > max_chars {
+                let context_byte_pos = context
+                    .char_indices()
+                    .nth(max_chars)
+                    .unwrap_or((context.len(), ' '))
+                    .0;
+                return context[..context_byte_pos].to_string();
+            }
         }
 
         context.trim_end().to_string()
@@ -172,17 +205,14 @@ impl DialogueManager {
         let turn = Turn::new(user.clone(), assistant.clone());
         let turn_id = self.current_session.turn_count();
 
-        // Сохраняем обмен в сессии
         self.current_session.add_turn(turn.clone());
 
-        // Векторизуем объединенный текст
-        let context_text = turn.combined_text();
-        let embedding = self.embedder.embed(&context_text)?;
+        let query_for_embedding = format!("User query: {}", user);
+        let embedding = self.embedder.embed(&query_for_embedding)?;
         eprintln!("DEBUG add_exchange: embedding.len() = {}", embedding.len());
 
-        // Создаем запись в векторной памяти
         let memory_entry = MemoryEntry::new(
-            context_text.clone(),
+            user.clone(),
             embedding,
             MemoryType::Episodic {
                 session_id: self.current_session.id,
@@ -197,9 +227,10 @@ impl DialogueManager {
         .with_metadata(
             "persona".to_string(),
             self.current_session.persona_name.clone(),
-        );
+        )
+        .with_metadata("user_query".to_string(), user)
+        .with_metadata("assistant_response".to_string(), assistant);
 
-        // Добавляем в векторное хранилище
         self.vector_store.add(memory_entry)?;
         eprintln!(
             "DEBUG add_exchange: vector_store.len() = {}",
@@ -211,35 +242,130 @@ impl DialogueManager {
 
     /// Ищет похожие диалоги по запросу
     pub fn find_similar_dialogues(&mut self, query: &str, top_k: usize) -> Result<Vec<String>> {
-        // Векторизуем запрос
         let query_embedding = self.embedder.embed(query)?;
 
-        // Ищем похожие эпизодические записи
         let memory_type = MemoryType::Episodic {
             session_id: Uuid::nil(),
-            turn: 0, // Используем нулевой turn для поиска всех эпизодов
+            turn: 0,
         };
 
-        let results = self
+        let results: Vec<(f32, crate::totems::retrieval::MemoryEntry)> = self
             .vector_store
-            .search_by_type(&query_embedding, &memory_type, top_k);
+            .search_by_type(&query_embedding, &memory_type, top_k * 3)
+            .into_iter()
+            .map(|(s, e)| (s, e.clone()))
+            .collect();
 
-        // Формируем текстовые результаты
+        let keyword_matches: Vec<(f32, crate::totems::retrieval::MemoryEntry)> = self
+            .keyword_search(query, top_k)
+            .into_iter()
+            .map(|(s, e)| (s + 0.1, e.clone()))
+            .collect();
+
+        let mut all_entries: Vec<(f32, crate::totems::retrieval::MemoryEntry)> = results
+            .into_iter()
+            .chain(keyword_matches.into_iter())
+            .collect();
+
+        all_entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        all_entries.truncate(top_k);
+
         let mut dialogues = Vec::new();
-        for (similarity, entry) in results {
-            let formatted = format!(
-                "[Similarity: {:.3}] Session: {} - {}",
-                similarity,
-                entry
-                    .metadata
-                    .get("session_id")
-                    .unwrap_or(&"unknown".to_string()),
-                entry.text
+        let mut seen = std::collections::HashSet::new();
+
+        for (similarity, entry) in all_entries {
+            let key = format!(
+                "{}-{}",
+                entry.metadata.get("session_id").unwrap_or(&"".to_string()),
+                entry.metadata.get("turn").unwrap_or(&"".to_string())
             );
+
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+
+            let user_query = entry
+                .metadata
+                .get("user_query")
+                .cloned()
+                .unwrap_or_else(|| entry.text.clone());
+
+            let assistant_response = entry
+                .metadata
+                .get("assistant_response")
+                .cloned()
+                .unwrap_or_default();
+
+            let context = format!("User: {}\nAssistant: {}", user_query, assistant_response);
+
+            let truncated = if context.chars().count() > 200 {
+                if let Some((byte_pos, _)) = context.char_indices().nth(200) {
+                    let trunc = &context[..byte_pos];
+                    if let Some(newline_pos) = trunc.rfind('\n') {
+                        &context[..newline_pos]
+                    } else if let Some(space_pos) = trunc.rfind(' ') {
+                        &context[..space_pos]
+                    } else {
+                        trunc
+                    }
+                } else {
+                    &context
+                }
+                .to_string()
+                    + "..."
+            } else {
+                context
+            };
+
+            let formatted = format!("[Similarity: {:.3}] {}", similarity, truncated);
             dialogues.push(formatted);
         }
 
         Ok(dialogues)
+    }
+
+    fn keyword_search(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Vec<(f32, crate::totems::retrieval::MemoryEntry)> {
+        let keywords: Vec<&str> = query.split_whitespace().filter(|w| w.len() > 3).collect();
+
+        if keywords.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches: Vec<(f32, crate::totems::retrieval::MemoryEntry)> = Vec::new();
+
+        for entry in self.vector_store.entries() {
+            let user_text = entry
+                .metadata
+                .get("user_query")
+                .unwrap_or(&entry.text)
+                .to_lowercase();
+
+            let assistant_text = entry
+                .metadata
+                .get("assistant_response")
+                .unwrap_or(&String::new())
+                .to_lowercase();
+
+            let full_text = format!("{} {}", user_text, assistant_text);
+
+            let keyword_count = keywords
+                .iter()
+                .filter(|k| full_text.contains(&*k.to_lowercase()))
+                .count();
+            if keyword_count > 0 {
+                let score = (keyword_count as f32 / keywords.len() as f32).min(1.0);
+                matches.push((score, entry.clone()));
+            }
+        }
+
+        matches.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        matches.truncate(top_k);
+        matches
     }
 
     /// Ищет диалоги с конкретной сессии
@@ -265,7 +391,7 @@ impl DialogueManager {
 
     /// Получает контекст текущей сессии
     pub fn get_current_context(&self, max_turns: usize) -> String {
-        self.current_session.format_context(max_turns)
+        self.current_session.format_context(max_turns, 512)
     }
 
     /// Начинает новую сессию

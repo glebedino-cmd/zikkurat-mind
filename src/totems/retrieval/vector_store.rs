@@ -275,6 +275,11 @@ impl VectorStore {
     pub fn dimension(&self) -> usize {
         self.dimension
     }
+
+    /// Возвращает итератор по всем записям (для персистентности)
+    pub fn entries(&self) -> impl Iterator<Item = &MemoryEntry> {
+        self.entries.iter()
+    }
 }
 
 /// Статистика векторного хранилища

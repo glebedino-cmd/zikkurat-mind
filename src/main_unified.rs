@@ -15,8 +15,8 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::mistral::{Config, Model as Mistral};
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use std::cmp::min;
 use std::io::Write;
-use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -37,6 +37,11 @@ struct UnifiedPipeline {
 }
 
 impl UnifiedPipeline {
+    /// Очищает KV кэш между запросами
+    pub fn clear_cache(&mut self) {
+        self.model.clear_kv_cache();
+    }
+
     fn new(
         model: Mistral,
         tokenizer: Tokenizer,
@@ -71,7 +76,7 @@ impl UnifiedPipeline {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<String> {
+    fn run(&mut self, prompt: &str, sample_len: usize, seed: u64) -> Result<String> {
         let mut tokens = self
             .tokenizer
             .encode(prompt, true)
@@ -79,20 +84,34 @@ impl UnifiedPipeline {
             .get_ids()
             .to_vec();
 
+        eprintln!("DEBUG: Input tokens count: {}", tokens.len());
+
         let mut generated_tokens = 0usize;
         let eos_token = match self.tokenizer.get_vocab(false).get("</s>") {
             Some(&t) => t,
             None => 2,
         };
 
+        let temperature = 0.;
+        let sampling = if temperature <= 0. {
+            Sampling::ArgMax
+        } else {
+            Sampling::All { temperature }
+        };
+        let _logits_processor = LogitsProcessor::from_sampling(seed, sampling);
+
         let start_gen = std::time::Instant::now();
         let mut output_tokens = Vec::new();
 
         for index in 0..sample_len {
-            let context_size = if index > 0 { 1 } else { tokens.len() };
-            let start_pos = tokens.len().saturating_sub(context_size);
+            let start_pos = if index == 0 {
+                0
+            } else {
+                tokens.len().saturating_sub(1)
+            };
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
+
             let logits = self
                 .model
                 .forward(&input, start_pos)?
@@ -174,8 +193,12 @@ struct Args {
     #[arg(long)]
     enable_memory: bool,
 
+    /// Disable memory context after first exchange (workaround for Candle compatibility)
+    #[arg(long)]
+    disable_memory_context: bool,
+
     /// Number of similar dialogues to retrieve
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 5)]
     memory_top_k: usize,
 
     /// Persona name for the session
@@ -195,18 +218,57 @@ struct Args {
     interactive: bool,
 }
 
+const MAX_DIALOGUE_LENGTH: usize = 100;
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let char_pos = text.char_indices().nth(max_chars);
+    match char_pos {
+        Some((byte_pos, _)) => {
+            let truncated = &text[..byte_pos];
+            if let Some(last_newline) = truncated.rfind('\n') {
+                truncated[..last_newline].to_string()
+            } else if let Some(last_space) = truncated.rfind(' ') {
+                truncated[..last_space].to_string() + "..."
+            } else {
+                truncated.to_string() + "..."
+            }
+        }
+        None => text.to_string(),
+    }
+}
+
 fn build_prompt_with_context(
     user_input: &str,
     memory_context: &str,
+    current_context: &str,
     enable_memory: bool,
 ) -> String {
-    if !enable_memory || memory_context.is_empty() {
+    if !enable_memory || (memory_context.is_empty() && current_context.is_empty()) {
         return format!("[INST] {} [/INST]", user_input);
     }
 
+    if memory_context.is_empty() {
+        return format!(
+            "[INST] Current conversation:\n{}\n\nUser: {} [/INST]",
+            current_context, user_input
+        );
+    }
+
+    if current_context.is_empty() {
+        return format!(
+            "[INST] {} [/INST]\n\nMEMORY (use this to answer about user's preferences):\n{}",
+            user_input, memory_context
+        );
+    }
+
     format!(
-        "[INST] {} [/INST]\n\nRelevant context from memory:\n{}",
-        user_input, memory_context
+        "[INST] Current conversation:\n{}\n\nUser: {} [/INST]\n\nMEMORY (use this to answer about user's preferences):\n{}",
+        current_context, user_input, memory_context
     )
 }
 
@@ -214,30 +276,60 @@ fn process_query(
     prompt: &str,
     pipeline: &mut UnifiedPipeline,
     dialogue_manager: &mut Option<DialogueManager>,
+    persistence_manager: &std::sync::Arc<totems::episodic::persistence::PersistenceManager>,
+    embedder: &Arc<dyn crate::priests::embeddings::Embedder>,
     args: &Args,
 ) -> Result<()> {
-    let memory_context = if let Some(ref mut dm) = *dialogue_manager {
-        let similar = dm.find_similar_dialogues(prompt, args.memory_top_k)?;
-        eprintln!("DEBUG: Found {} similar dialogues", similar.len());
-        for (i, s) in similar.iter().enumerate() {
-            eprintln!("DEBUG: Similar[{}] = {}", i, s);
-        }
-        if !similar.is_empty() {
-            println!("🧠 Found {} relevant memory entries", similar.len());
-            similar.join("\n\n")
+    let (similar_dialogues, current_context) = if let Some(ref mut dm) = *dialogue_manager {
+        if args.disable_memory_context {
+            (String::new(), String::new())
         } else {
-            String::new()
+            let similar = dm.find_similar_dialogues(prompt, args.memory_top_k)?;
+            eprintln!("DEBUG: Found {} similar dialogues", similar.len());
+            for (i, s) in similar.iter().enumerate() {
+                eprintln!("DEBUG: Similar[{}] = {}", i, s);
+            }
+
+            let current_ctx = dm.get_current_context(5);
+            eprintln!(
+                "DEBUG: Current session context length: {}",
+                current_ctx.len()
+            );
+
+            let similar_text = if !similar.is_empty() {
+                println!("🧠 Found {} relevant memory entries", similar.len());
+                let truncated: Vec<String> = similar
+                    .iter()
+                    .map(|s| truncate_text(s, MAX_DIALOGUE_LENGTH))
+                    .collect();
+                truncated.join("\n\n")
+            } else {
+                String::new()
+            };
+
+            (similar_text, current_ctx)
         }
     } else {
-        String::new()
+        (String::new(), String::new())
     };
 
-    let enhanced_prompt = build_prompt_with_context(prompt, &memory_context, args.enable_memory);
+    let enhanced_prompt = build_prompt_with_context(
+        prompt,
+        &similar_dialogues,
+        &current_context,
+        args.enable_memory,
+    );
+
+    eprintln!("DEBUG: Enhanced prompt length: {}", enhanced_prompt.len());
+    eprintln!(
+        "DEBUG: Enhanced prompt preview: {}",
+        &enhanced_prompt[..min(200, enhanced_prompt.len())]
+    );
 
     println!("\n📝 User: {}", prompt);
     println!("\n🤖 Assistant:");
 
-    let response = pipeline.run(&enhanced_prompt, args.sample_len)?;
+    let response = pipeline.run(&enhanced_prompt, args.sample_len, args.seed)?;
 
     println!("{}", response);
 
@@ -248,9 +340,34 @@ fn process_query(
             "\n💾 Memory: {} turns in current session",
             stats.current_session_turns
         );
+
+        if let Err(e) = persistence_manager.save_with_embeddings(dm, embedder.embedding_dim()) {
+            eprintln!("WARNING: Failed to save memory: {}", e);
+        }
     }
 
     Ok(())
+}
+
+fn resolve_path(path: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let exe_path = std::env::current_exe().unwrap_or(std::path::PathBuf::from("."));
+    let mut current = exe_path.as_path();
+
+    while let Some(parent) = current.parent() {
+        if parent.join("Cargo.toml").exists() {
+            return parent.join(path);
+        }
+        current = parent;
+    }
+
+    std::env::current_dir()
+        .unwrap_or(std::path::PathBuf::from("."))
+        .join(path)
 }
 
 fn main() -> Result<()> {
@@ -261,19 +378,47 @@ fn main() -> Result<()> {
     let device = select_device(args.cpu)?;
     println!("📱 Device: {:?}", device);
 
-    println!("🧠 Loading embedding engine from: {}", args.embedding_path);
-    let embedder: Arc<dyn Embedder> = if Path::new(&args.embedding_path).exists() {
-        Arc::new(EmbeddingEngine::new(&args.embedding_path, device.clone())?)
-    } else {
-        anyhow::bail!("Embedding model not found at: {}", args.embedding_path);
-    };
+    let embedding_path = resolve_path(&args.embedding_path);
+    println!(
+        "🧠 Loading embedding engine from: {}",
+        embedding_path.display()
+    );
+
+    if !embedding_path.exists() {
+        anyhow::bail!(
+            "Embedding model not found at: {}\n\
+             Current directory: {:?}\n\
+             Resolved from: {:?}",
+            embedding_path.display(),
+            std::env::current_dir().unwrap_or_default(),
+            args.embedding_path
+        );
+    }
+
+    let embedder: Arc<dyn Embedder> = Arc::new(EmbeddingEngine::new(
+        embedding_path.to_str().unwrap_or(&args.embedding_path),
+        device.clone(),
+    )?);
     println!(
         "✅ Embedding engine loaded (dim: {})",
         embedder.embedding_dim()
     );
 
+    // Инициализируем persistence manager
+    let persistence_manager = std::sync::Arc::new(
+        totems::episodic::persistence::PersistenceManager::new(Some(&resolve_path("")), true)?,
+    );
+
     let mut dialogue_manager = if args.enable_memory {
-        Some(DialogueManager::new(embedder.clone(), args.persona.clone()))
+        match persistence_manager.load_with_embeddings(embedder.clone(), args.persona.clone())? {
+            Some((manager, sessions)) => {
+                println!("💾 Loaded {} saved sessions", sessions.len());
+                let stats = manager.stats();
+                println!("📊 Vector store: {} entries", stats.total_turns);
+                Some(manager)
+            }
+            None => Some(DialogueManager::new(embedder.clone(), args.persona.clone())),
+        }
     } else {
         None
     };
@@ -285,20 +430,27 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| "mistralai/Mistral-7B-Instruct-v0.2".to_string());
 
+    let local_mistral_path = resolve_path("models/mistral-7b-instruct");
+    let use_local_path = local_mistral_path.exists()
+        && local_mistral_path.join("tokenizer.json").exists()
+        && local_mistral_path
+            .join("model.safetensors.index.json")
+            .exists();
+
     let (tokenizer, filenames, config_path): (
         Tokenizer,
         Vec<std::path::PathBuf>,
         std::path::PathBuf,
-    ) = if Path::new(&model_id).exists() && Path::new(&model_id).join("tokenizer.json").exists() {
-        let local_path = std::path::Path::new(&model_id).to_path_buf();
+    ) = if use_local_path {
+        let local_path = local_mistral_path;
+        eprintln!("DEBUG: Loading from local path: {:?}", local_path);
+
         let tokenizer = Tokenizer::from_file(local_path.join("tokenizer.json")).map_err(E::msg)?;
 
-        // Читаем safetensors index для определения файлов
         let index_path = local_path.join("model.safetensors.index.json");
         let index_content = std::fs::read_to_string(&index_path)?;
         let index: serde_json::Value = serde_json::from_str(&index_content)?;
 
-        // Извлекаем уникальные имена файлов из weight_map
         let mut unique_files = std::collections::HashSet::<String>::new();
         if let Some(weight_map) = index.get("weight_map").and_then(|v| v.as_object()) {
             for file in weight_map.values() {
@@ -308,9 +460,18 @@ fn main() -> Result<()> {
             }
         }
 
-        // Сортируем для последовательной загрузки
+        if unique_files.is_empty() {
+            anyhow::bail!("No weight files found in safetensors index");
+        }
+
         let mut filenames: Vec<_> = unique_files.into_iter().collect();
         filenames.sort();
+
+        eprintln!(
+            "DEBUG: Found {} weight files: {:?}",
+            filenames.len(),
+            filenames
+        );
 
         (
             tokenizer,
@@ -332,6 +493,31 @@ fn main() -> Result<()> {
     };
 
     let config: Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
+
+    // Validate config for Mistral 7B
+    if config.hidden_size != 4096 {
+        eprintln!(
+            "WARNING: Expected hidden_size=4096 for Mistral 7B, got {}. This may cause issues.",
+            config.hidden_size
+        );
+    }
+    if config.num_attention_heads != 32 {
+        eprintln!(
+            "WARNING: Expected num_attention_heads=32 for Mistral 7B, got {}.",
+            config.num_attention_heads
+        );
+    }
+    if config.num_hidden_layers != 32 {
+        eprintln!(
+            "WARNING: Expected num_hidden_layers=32 for Mistral 7B, got {}.",
+            config.num_hidden_layers
+        );
+    }
+
+    eprintln!(
+        "DEBUG: Config loaded - hidden_size: {}, num_heads: {}, num_layers: {}",
+        config.hidden_size, config.num_attention_heads, config.num_hidden_layers
+    );
 
     let dtype = if device.is_cuda() {
         DType::BF16
@@ -360,7 +546,15 @@ fn main() -> Result<()> {
         println!("========================================");
 
         if let Some(ref initial_prompt) = args.prompt {
-            process_query(initial_prompt, &mut pipeline, &mut dialogue_manager, &args)?;
+            pipeline.clear_cache();
+            process_query(
+                initial_prompt,
+                &mut pipeline,
+                &mut dialogue_manager,
+                &persistence_manager,
+                &embedder,
+                &args,
+            )?;
         }
 
         loop {
@@ -375,11 +569,30 @@ fn main() -> Result<()> {
                 continue;
             }
             if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
+                // Сохраняем память перед выходом
+                if let Some(ref dm) = dialogue_manager {
+                    if let Err(e) =
+                        persistence_manager.save_with_embeddings(dm, embedder.embedding_dim())
+                    {
+                        eprintln!("WARNING: Failed to save memory on exit: {}", e);
+                    } else {
+                        println!("💾 Memory saved to disk");
+                    }
+                }
                 println!("👋 Goodbye!");
                 break;
             }
 
-            if let Err(e) = process_query(input, &mut pipeline, &mut dialogue_manager, &args) {
+            pipeline.clear_cache();
+
+            if let Err(e) = process_query(
+                input,
+                &mut pipeline,
+                &mut dialogue_manager,
+                &persistence_manager,
+                &embedder,
+                &args,
+            ) {
                 eprintln!("Error: {}", e);
             }
         }
@@ -388,8 +601,25 @@ fn main() -> Result<()> {
             eprintln!("Error: --prompt is required (or use --interactive)");
             std::process::exit(1);
         };
+        pipeline.clear_cache();
         let args_ref = &args;
-        process_query(prompt, &mut pipeline, &mut dialogue_manager, args_ref)?;
+        process_query(
+            prompt,
+            &mut pipeline,
+            &mut dialogue_manager,
+            &persistence_manager,
+            &embedder,
+            args_ref,
+        )?;
+
+        // Сохраняем память после выполнения
+        if let Some(ref dm) = dialogue_manager {
+            if let Err(e) = persistence_manager.save_with_embeddings(dm, embedder.embedding_dim()) {
+                eprintln!("WARNING: Failed to save memory: {}", e);
+            } else {
+                println!("💾 Memory saved to disk");
+            }
+        }
     }
 
     Ok(())
