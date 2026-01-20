@@ -2,5 +2,4 @@
 
 pub mod episodic;
 pub mod retrieval;
-
-// Re-export для удобного импорта
+pub mod semantic;

@@ -15,7 +15,6 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::mistral::{Config, Model as Mistral};
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use std::cmp::min;
 use std::io::Write;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
@@ -23,9 +22,107 @@ use tokenizers::Tokenizer;
 use crate::priests::device::select_device;
 use crate::priests::embeddings::{Embedder, EmbeddingEngine};
 use crate::totems::episodic::DialogueManager;
+use crate::totems::semantic::{SemanticMemoryManager};
+use crate::totems::semantic::concept::ConceptCategory;
 use crate::utils::hub_load_safetensors;
 
 const DEFAULT_SAMPLE_LEN: usize = 2048;
+
+struct ConceptExtractorImpl {
+    pipeline: std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>,
+}
+
+impl ConceptExtractorImpl {
+    fn new(pipeline: std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>) -> Self {
+        Self { pipeline }
+    }
+}
+
+impl totems::semantic::ConceptExtractor for ConceptExtractorImpl {
+    fn extract(
+        &mut self,
+        user_query: &str,
+        assistant_response: &str,
+        _session_id: &str,
+    ) -> Result<totems::semantic::ExtractionResult> {
+        let prompt = format!(
+            r#"<s>[INST] You are a knowledge extraction assistant. Extract facts, preferences, rules, skills from the dialogue below.
+
+Return ONLY a JSON array. Each object must have:
+- "text": concise knowledge statement (max 100 chars)
+- "category": one of facts, rules, preferences, skills, general
+- "confidence": float between 0.0 and 1.0
+
+If no knowledge found, return empty array [].
+
+Dialogue:
+User: {user_query}
+Assistant: {assistant_response}
+
+Output format: [{{"text":"...","category":"...","confidence":0.8}}]
+NO markdown, NO explanations, NO text before or after. Only JSON.
+[/INST]</s>"#,
+            user_query = user_query,
+            assistant_response = assistant_response
+        );
+
+        let response = {
+            let mut pipeline = self.pipeline.lock().unwrap();
+            pipeline.clear_cache();
+            pipeline.run(&prompt, 200, 0)?
+        };
+
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+
+        let parse_json = |s: &str| -> Result<Vec<serde_json::Value>, _> {
+            serde_json::from_str(s)
+        };
+
+        let concepts: Vec<serde_json::Value> = match parse_json(&cleaned) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("DEBUG: Direct JSON parse failed: {}", e);
+                let without_brackets = cleaned.trim_start_matches('[').trim_end_matches(']');
+                match parse_json(&format!("[{}]", without_brackets)) {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        eprintln!("DEBUG: Bracket-wrapped parse also failed: {} | Input: {}", e2, cleaned);
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        };
+
+        let mut results = Vec::new();
+        for value in concepts {
+            let text = match value.get("text").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+
+            let category = value
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "general".to_string());
+
+            let confidence: f32 = value
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5) as f32;
+
+            results.push((text, category, confidence));
+        }
+
+        Ok(results)
+    }
+}
 
 struct UnifiedPipeline {
     model: Mistral,
@@ -193,6 +290,10 @@ struct Args {
     #[arg(long)]
     enable_memory: bool,
 
+    /// Enable semantic memory (facts, rules, preferences)
+    #[arg(long)]
+    enable_semantic: bool,
+
     /// Disable memory context after first exchange (workaround for Candle compatibility)
     #[arg(long)]
     disable_memory_context: bool,
@@ -200,6 +301,10 @@ struct Args {
     /// Number of similar dialogues to retrieve
     #[arg(long, default_value_t = 5)]
     memory_top_k: usize,
+
+    /// Number of semantic concepts to retrieve
+    #[arg(long, default_value_t = 10)]
+    semantic_top_k: usize,
 
     /// Persona name for the session
     #[arg(long, default_value = "assistant")]
@@ -216,9 +321,50 @@ struct Args {
     /// Interactive mode - keep running for multiple queries
     #[arg(long)]
     interactive: bool,
+
+    /// Maximum number of sessions to keep in memory
+    #[arg(long, default_value_t = 50)]
+    max_sessions: usize,
 }
 
 const MAX_DIALOGUE_LENGTH: usize = 100;
+
+fn get_memory_mb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    if let Some(val) = line.split_whitespace().nth(1) {
+                        return val.parse::<u64>().unwrap_or(0) / 1024;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+fn get_gpu_memory_mb() -> Option<u64> {
+    std::process::Command::new("nvidia-smi")
+        .args(&["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.trim().parse::<u64>().ok()
+        })
+}
+
+fn log_memory_usage(_label: &str) {
+    let mem_mb = get_memory_mb();
+    if mem_mb > 0 {
+        eprintln!("DEBUG [{}]: RAM: {} MB", _label, mem_mb);
+    }
+    if let Some(gpu_mb) = get_gpu_memory_mb() {
+        eprintln!("DEBUG [{}]: VRAM: {} MB", _label, gpu_mb);
+    }
+}
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
@@ -244,51 +390,54 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 
 fn build_prompt_with_context(
     user_input: &str,
-    memory_context: &str,
+    episodic_context: &str,
+    semantic_context: &str,
     current_context: &str,
     enable_memory: bool,
 ) -> String {
-    if !enable_memory || (memory_context.is_empty() && current_context.is_empty()) {
+    if !enable_memory || (episodic_context.is_empty() && semantic_context.is_empty() && current_context.is_empty()) {
         return format!("[INST] {} [/INST]", user_input);
     }
 
-    if memory_context.is_empty() {
-        return format!(
-            "[INST] Current conversation:\n{}\n\nUser: {} [/INST]",
-            current_context, user_input
-        );
+    let mut context_parts = Vec::new();
+
+    if !current_context.is_empty() {
+        context_parts.push(format!("Current conversation:\n{}", current_context));
     }
 
-    if current_context.is_empty() {
-        return format!(
-            "[INST] {} [/INST]\n\nMEMORY (use this to answer about user's preferences):\n{}",
-            user_input, memory_context
-        );
+    if !semantic_context.is_empty() {
+        context_parts.push(format!("KNOWLEDGE:\n{}", semantic_context));
     }
+
+    if !episodic_context.is_empty() {
+        context_parts.push(format!("RELATED MEMORY:\n{}", episodic_context));
+    }
+
+    let combined_context = context_parts.join("\n\n");
 
     format!(
-        "[INST] Current conversation:\n{}\n\nUser: {} [/INST]\n\nMEMORY (use this to answer about user's preferences):\n{}",
-        current_context, user_input, memory_context
+        "[INST] {} [/INST]\n\n{}",
+        user_input, combined_context
     )
 }
 
 fn process_query(
     prompt: &str,
-    pipeline: &mut UnifiedPipeline,
+    pipeline_arc: &std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>,
     dialogue_manager: &mut Option<DialogueManager>,
+    semantic_manager: &mut Option<std::sync::Mutex<SemanticMemoryManager>>,
     persistence_manager: &std::sync::Arc<totems::episodic::persistence::PersistenceManager>,
     embedder: &Arc<dyn crate::priests::embeddings::Embedder>,
     args: &Args,
 ) -> Result<()> {
+    log_memory_usage("process_query start");
+
     let (similar_dialogues, current_context) = if let Some(ref mut dm) = *dialogue_manager {
         if args.disable_memory_context {
             (String::new(), String::new())
         } else {
             let similar = dm.find_similar_dialogues(prompt, args.memory_top_k)?;
             eprintln!("DEBUG: Found {} similar dialogues", similar.len());
-            for (i, s) in similar.iter().enumerate() {
-                eprintln!("DEBUG: Similar[{}] = {}", i, s);
-            }
 
             let current_ctx = dm.get_current_context(5);
             eprintln!(
@@ -313,25 +462,50 @@ fn process_query(
         (String::new(), String::new())
     };
 
+    let semantic_context = if args.enable_semantic {
+        if let Some(ref sm) = *semantic_manager {
+            let sm = sm.lock().unwrap();
+            let results = sm.search_by_text(prompt, args.semantic_top_k);
+            if !results.is_empty() {
+                println!("📚 Found {} relevant concepts", results.len());
+                let context: Vec<String> = results
+                    .iter()
+                    .map(|(sim, concept)| {
+                        format!("[{} {:.2}] {}", concept.category, sim, truncate_text(&concept.text, 200))
+                    })
+                    .collect();
+                context.join("\n")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let enhanced_prompt = build_prompt_with_context(
         prompt,
         &similar_dialogues,
+        &semantic_context,
         &current_context,
-        args.enable_memory,
+        args.enable_memory || args.enable_semantic,
     );
 
     eprintln!("DEBUG: Enhanced prompt length: {}", enhanced_prompt.len());
-    eprintln!(
-        "DEBUG: Enhanced prompt preview: {}",
-        &enhanced_prompt[..min(200, enhanced_prompt.len())]
-    );
 
     println!("\n📝 User: {}", prompt);
     println!("\n🤖 Assistant:");
 
-    let response = pipeline.run(&enhanced_prompt, args.sample_len, args.seed)?;
+    let response = pipeline_arc.lock().unwrap().run(&enhanced_prompt, args.sample_len, args.seed)?;
 
     println!("{}", response);
+
+    let session_id = dialogue_manager
+        .as_ref()
+        .map(|dm| dm.current_session().id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
     if let Some(ref mut dm) = *dialogue_manager {
         dm.add_exchange(prompt.to_string(), response.clone())?;
@@ -346,6 +520,17 @@ fn process_query(
         }
     }
 
+    if args.enable_semantic {
+        if let Some(ref sm) = *semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            if let Err(e) = sm.extract_from_dialogue(prompt, &response, &session_id) {
+                eprintln!("DEBUG: Failed to extract concepts: {}", e);
+            }
+            eprintln!("DEBUG: Semantic memory now has {} concepts", sm.count());
+        }
+    }
+
+    log_memory_usage("process_query end");
     Ok(())
 }
 
@@ -423,7 +608,32 @@ fn main() -> Result<()> {
         None
     };
 
+    let mut semantic_manager = if args.enable_semantic {
+        let semantic_persistence = totems::semantic::persistence::SemanticPersistenceManager::new(
+            Some(&resolve_path("memory_data")),
+        )?;
+        let sm = SemanticMemoryManager::new(embedder.clone(), semantic_persistence)?;
+        let count = sm.count();
+        if count > 0 {
+            println!("📚 Loaded {} semantic concepts", count);
+        }
+        Some(std::sync::Mutex::new(sm))
+    } else {
+        None
+    };
+
     println!("🤖 Loading Mistral 7B...");
+
+    // Show device selection status
+    if device.is_cuda() {
+        println!("🚀 Device: GPU (CUDA) - using VRAM, not system RAM");
+    } else {
+        let mem_mb = get_memory_mb();
+        println!("💻 Device: CPU - System RAM: {} MB", mem_mb);
+        if mem_mb > 0 && mem_mb < 16000 {
+            eprintln!("⚠️  WARNING: CPU mode requires ~16GB RAM. GPU recommended!");
+        }
+    }
 
     let model_id = args
         .model_id
@@ -442,7 +652,7 @@ fn main() -> Result<()> {
         Vec<std::path::PathBuf>,
         std::path::PathBuf,
     ) = if use_local_path {
-        let local_path = local_mistral_path;
+        let local_path = local_mistral_path.clone();
         eprintln!("DEBUG: Loading from local path: {:?}", local_path);
 
         let tokenizer = Tokenizer::from_file(local_path.join("tokenizer.json")).map_err(E::msg)?;
@@ -473,11 +683,7 @@ fn main() -> Result<()> {
             filenames
         );
 
-        (
-            tokenizer,
-            filenames.into_iter().map(|f| local_path.join(f)).collect(),
-            local_path.join("config.json"),
-        )
+        (tokenizer, filenames.into_iter().map(|f| local_path.join(f)).collect(), local_path.join("config.json"))
     } else {
         let api = Api::new()?;
         let revision = args.revision.clone();
@@ -491,6 +697,26 @@ fn main() -> Result<()> {
         let filenames = hub_load_safetensors(&repo, "model.safetensors-index.json")?;
         (tokenizer, filenames, repo.get("config.json")?)
     };
+
+    // Check available memory before loading model
+    let available_memory_mb = get_memory_mb();
+    let is_cuda = device.is_cuda();
+
+    if !is_cuda && available_memory_mb > 0 {
+        let required_memory_mb = 18000; // ~18GB for full model + overhead
+        if available_memory_mb < required_memory_mb {
+            eprintln!("\n⚠️  WARNING: Low memory situation!");
+            eprintln!("   Available: {} MB", available_memory_mb);
+            eprintln!("   Required:  ~{} MB for Mistral 7B", required_memory_mb);
+            eprintln!("\n   Options:");
+            eprintln!("   1. Use GPU (CUDA) - recommended");
+            eprintln!("   2. Close other applications to free RAM");
+            eprintln!("   3. Use a smaller model (7B quantized)");
+            eprintln!("\n   Continuing anyway, but may encounter OOM...\n");
+        }
+    }
+
+    log_memory_usage("before_model_load");
 
     let config: Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
 
@@ -520,37 +746,77 @@ fn main() -> Result<()> {
     );
 
     let dtype = if device.is_cuda() {
+        println!("🎯 Using GPU (BF16 precision)");
         DType::BF16
     } else {
-        DType::F32
+        // CPU fallback: use quantized types to save memory
+        let available_memory_mb = get_memory_mb();
+        let mem_threshold = 16000; // 16GB threshold
+
+        if available_memory_mb > mem_threshold {
+            println!("💻 CPU mode: {} MB RAM available, using F32", available_memory_mb);
+            DType::F32
+        } else {
+            // Low memory: warn user
+            if available_memory_mb > 0 {
+                eprintln!("⚠️  WARNING: Only {} MB RAM available!", available_memory_mb);
+                eprintln!("    Mistral 7B requires ~16GB on CPU. Consider using GPU.");
+            }
+            println!("💻 CPU mode: F32 (full precision)");
+            DType::F32
+        }
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
     let model = Mistral::new(&config, vb)?;
 
-    println!("✅ Mistral 7B loaded");
+    let pipeline_arc: std::sync::Arc<std::sync::Mutex<UnifiedPipeline>> =
+        std::sync::Arc::new(std::sync::Mutex::new(UnifiedPipeline::new(
+            model,
+            tokenizer,
+            device.clone(),
+            Some(args.temperature),
+            args.top_p,
+            args.top_k,
+            1.1,
+            64,
+            args.seed,
+        )));
 
-    let mut pipeline = UnifiedPipeline::new(
-        model,
-        tokenizer,
-        device,
-        Some(args.temperature),
-        args.top_p,
-        args.top_k,
-        1.1,
-        64,
-        args.seed,
-    );
+    log_memory_usage("after_model_load");
+
+    if device.is_cuda() {
+        println!("✅ Mistral 7B loaded on GPU (using VRAM)");
+    } else {
+        let mem_mb = get_memory_mb();
+        println!("✅ Mistral 7B loaded on CPU (using {} MB RAM)", mem_mb);
+        if mem_mb > 20000 {
+            println!("💡 Tip: Use --features cuda for GPU inference (faster + less RAM)");
+        }
+    }
+
+    if args.enable_semantic {
+        let extractor = Arc::new(std::sync::Mutex::new(ConceptExtractorImpl::new(pipeline_arc.clone())));
+
+        if let Some(ref mut sm) = semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            sm.set_extractor(extractor);
+            drop(sm);
+        }
+    }
 
     if args.interactive {
         println!("\n🗣️ Interactive mode - type 'quit' to exit");
+        println!("   /semantic - Manage semantic memory");
+        println!("   /mem - Show memory usage");
         println!("========================================");
 
         if let Some(ref initial_prompt) = args.prompt {
-            pipeline.clear_cache();
+            pipeline_arc.lock().unwrap().clear_cache();
             process_query(
                 initial_prompt,
-                &mut pipeline,
+                &pipeline_arc,
                 &mut dialogue_manager,
+                &mut semantic_manager,
                 &persistence_manager,
                 &embedder,
                 &args,
@@ -576,19 +842,51 @@ fn main() -> Result<()> {
                     {
                         eprintln!("WARNING: Failed to save memory on exit: {}", e);
                     } else {
-                        println!("💾 Memory saved to disk");
+                        println!("💾 Episodic memory saved to disk");
+                    }
+                }
+                if let Some(ref sm) = semantic_manager {
+                    let sm = sm.lock().unwrap();
+                    let count = sm.count();
+                    if count > 0 {
+                        println!("📚 Semantic memory: {} concepts saved", count);
                     }
                 }
                 println!("👋 Goodbye!");
                 break;
             }
 
-            pipeline.clear_cache();
+            pipeline_arc.lock().unwrap().clear_cache();
+
+            if input.starts_with("/semantic") || input.starts_with("/s") {
+                if !args.enable_semantic {
+                    println!("Semantic memory is disabled. Use --enable-semantic to enable.");
+                    continue;
+                }
+                if let Some(ref sm) = semantic_manager {
+                    handle_semantic_command(input, sm);
+                } else {
+                    println!("Semantic memory not initialized.");
+                }
+                continue;
+            }
+
+            if input == "/mem" || input == "/memory" {
+                let mem_mb = get_memory_mb();
+                if mem_mb > 0 {
+                    println!("💻 RAM: {} MB", mem_mb);
+                }
+                if let Some(gpu_mb) = get_gpu_memory_mb() {
+                    println!("🚀 VRAM: {} MB", gpu_mb);
+                }
+                continue;
+            }
 
             if let Err(e) = process_query(
                 input,
-                &mut pipeline,
+                &pipeline_arc,
                 &mut dialogue_manager,
+                &mut semantic_manager,
                 &persistence_manager,
                 &embedder,
                 &args,
@@ -601,12 +899,13 @@ fn main() -> Result<()> {
             eprintln!("Error: --prompt is required (or use --interactive)");
             std::process::exit(1);
         };
-        pipeline.clear_cache();
+        pipeline_arc.lock().unwrap().clear_cache();
         let args_ref = &args;
         process_query(
             prompt,
-            &mut pipeline,
+            &pipeline_arc,
             &mut dialogue_manager,
+            &mut semantic_manager,
             &persistence_manager,
             &embedder,
             args_ref,
@@ -617,10 +916,236 @@ fn main() -> Result<()> {
             if let Err(e) = persistence_manager.save_with_embeddings(dm, embedder.embedding_dim()) {
                 eprintln!("WARNING: Failed to save memory: {}", e);
             } else {
-                println!("💾 Memory saved to disk");
+                println!("💾 Episodic memory saved to disk");
+            }
+        }
+        if let Some(ref sm) = semantic_manager {
+            let sm = sm.lock().unwrap();
+            let count = sm.count();
+            if count > 0 {
+                println!("📚 Semantic memory: {} concepts saved", count);
             }
         }
     }
 
     Ok(())
+}
+
+fn handle_semantic_command(input: &str, sm: &std::sync::Mutex<totems::semantic::SemanticMemoryManager>) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let command = parts.get(1).map(|s| *s).unwrap_or("");
+
+    match command {
+        "help" | "h" => {
+            println!(r#"
+ 📚 Semantic Memory Commands:
+   /semantic help           - Show this help
+   /semantic list [n]       - List concepts (default: 10)
+   /semantic list <category> [n] - List concepts by category (facts|rules|preferences|skills|general)
+   /semantic stats          - Show statistics
+   /semantic search <query> - Search concepts
+   /semantic add "<text>" <category> [confidence] - Add new concept
+   /semantic vote <id> <up|down> - Vote to adjust concept confidence
+   /semantic delete <id>    - Delete concept by ID
+   /semantic merge          - Merge duplicate concepts
+   /semantic get <id>       - Show concept by ID
+   Short form: /s instead of /semantic
+"#);
+        }
+
+        "list" | "l" => {
+            let sm = sm.lock().unwrap();
+            if parts.len() >= 3 {
+                let cat_arg = parts[2].to_lowercase();
+                let category = match cat_arg.as_str() {
+                    "facts" | "rules" | "preferences" | "pref" | "skills" | "general" => {
+                        let category = match cat_arg.as_str() {
+                            "facts" => ConceptCategory::Facts,
+                            "rules" => ConceptCategory::Rules,
+                            "preferences" | "pref" => ConceptCategory::Preferences,
+                            "skills" => ConceptCategory::Skills,
+                            "general" => ConceptCategory::General,
+                            _ => unreachable!()
+                        };
+                        let limit = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+                        let concepts = sm.list_by_category(&category, limit);
+                        let total_in_cat = sm.get_concepts_by_category(&category).len();
+                        if concepts.is_empty() {
+                            println!("No concepts found in category '{}'.", category);
+                        } else {
+                            println!("📚 Concepts in {} (showing {} of {}):", category, concepts.len(), total_in_cat);
+                            for (i, c) in concepts.iter().enumerate() {
+                                println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {
+                        let limit = parts.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                        let concepts = sm.list_concepts(limit, 0);
+                        if concepts.is_empty() {
+                            println!("No concepts found.");
+                        } else {
+                            println!("📚 Concepts (showing {} of {}):", concepts.len(), sm.count());
+                            for (i, c) in concepts.iter().enumerate() {
+                                println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
+                            }
+                        }
+                    }
+                };
+            } else {
+                let limit = parts.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                let concepts = sm.list_concepts(limit, 0);
+                if concepts.is_empty() {
+                    println!("No concepts found.");
+                } else {
+                    println!("📚 Concepts (showing {} of {}):", concepts.len(), sm.count());
+                    for (i, c) in concepts.iter().enumerate() {
+                        println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
+                    }
+                }
+            }
+        }
+
+        "stats" | "st" => {
+            let sm = sm.lock().unwrap();
+            println!("{}", sm.stats_pretty());
+        }
+
+        "search" | "s" => {
+            if parts.len() < 3 {
+                println!("Usage: /semantic search <query>");
+                return;
+            }
+            let query = parts[2..].join(" ");
+            let sm = sm.lock().unwrap();
+            println!("{}", sm.search_pretty(&query, 10));
+        }
+
+        "add" | "a" => {
+            if parts.len() < 4 {
+                println!(r#"Usage: /semantic add "<text>" <category> [confidence]
+Categories: facts, rules, preferences, skills"#);
+                return;
+            }
+            let mut text = parts[2].to_string();
+            let mut idx = 3;
+            if text.starts_with('"') {
+                text = text.trim_start_matches('"').to_string();
+                while idx < parts.len() && !parts[idx].ends_with('"') {
+                    text.push(' ');
+                    text.push_str(parts[idx]);
+                    idx += 1;
+                }
+                if idx < parts.len() {
+                    text.push(' ');
+                    text.push_str(parts[idx].trim_end_matches('"'));
+                    idx += 1;
+                }
+            }
+            if idx >= parts.len() {
+                println!(r#"Usage: /semantic add "<text>" <category> [confidence]"#);
+                return;
+            }
+            let category = parts[idx];
+            idx += 1;
+            let confidence = parts.get(idx).and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.5);
+
+            let cat = match category {
+                "facts" => ConceptCategory::Facts,
+                "rules" => ConceptCategory::Rules,
+                "preferences" | "pref" => ConceptCategory::Preferences,
+                "skills" => ConceptCategory::Skills,
+                _ => {
+                    println!("Unknown category: {}. Use: facts, rules, preferences, skills", category);
+                    return;
+                }
+            };
+
+            let mut sm = sm.lock().unwrap();
+            match sm.add_concept(text.to_string(), cat, "manual".to_string(), Some(confidence)) {
+                Ok(c) => println!("✅ Added concept: {} ({})", c.id, c.category),
+                Err(e) => println!("❌ Error: {}", e),
+            }
+        }
+
+        "delete" | "del" | "remove" | "rm" => {
+            if parts.len() < 3 {
+                println!("Usage: /semantic delete <id>");
+                return;
+            }
+            let id = parts[2];
+            let mut sm = sm.lock().unwrap();
+            if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+                if sm.remove_concept(uuid) {
+                    println!("✅ Deleted concept: {}", id);
+                } else {
+                    println!("❌ Concept not found: {}", id);
+                }
+            } else {
+                println!("Invalid UUID: {}", id);
+            }
+        }
+
+        "merge" => {
+            let mut sm = sm.lock().unwrap();
+            match sm.merge_similar(0.8) {
+                Ok(count) => println!("✅ Merged {} duplicate concepts", count),
+                Err(e) => println!("❌ Error: {}", e),
+            }
+        }
+
+        "get" => {
+            if parts.len() < 3 {
+                println!("Usage: /semantic get <id>");
+                return;
+            }
+            let sm = sm.lock().unwrap();
+            if let Some(c) = sm.get_concept_by_id(parts[2]) {
+                println!("{}", sm.format_concept(c));
+            } else {
+                println!("Concept not found: {}", parts[2]);
+            }
+        }
+
+        "vote" | "v" => {
+            if parts.len() < 4 {
+                println!(r#"Usage: /semantic vote <id> <up|down>
+  /semantic vote <id> up   - Increase confidence by 0.1
+  /semantic vote <id> down - Decrease confidence by 0.1"#);
+                return;
+            }
+            let id = parts[2];
+            let direction = parts[3].to_lowercase();
+            let delta = match direction.as_str() {
+                "up" | "u" | "+" => 0.1,
+                "down" | "d" | "-" => -0.1,
+                _ => {
+                    println!("Invalid vote direction: {}. Use 'up' or 'down'", parts[3]);
+                    return;
+                }
+            };
+            let mut sm = sm.lock().unwrap();
+            if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+                if let Err(e) = sm.update_concept_confidence(uuid, delta) {
+                    println!("❌ Error: {}", e);
+                } else {
+                    if let Some(c) = sm.get_concept(uuid) {
+                        println!("✅ Voted {} on concept: confidence = {:.2}", if delta > 0.0 { "UP" } else { "DOWN" }, c.confidence);
+                    }
+                }
+            } else {
+                println!("Invalid UUID: {}", id);
+            }
+        }
+
+        "" => {
+            let sm = sm.lock().unwrap();
+            println!("📚 Semantic memory: {} concepts", sm.count());
+        }
+
+        _ => {
+            println!("Unknown command: {}. Use /semantic help", command);
+        }
+    }
 }

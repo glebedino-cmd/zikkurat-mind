@@ -237,7 +237,32 @@ impl DialogueManager {
             self.vector_store.len()
         );
 
+        self.cleanup_if_needed();
+
         Ok(())
+    }
+
+    /// Очищает старые сессии если превышен лимит
+    fn cleanup_if_needed(&mut self) {
+        let total = self.session_history.len() + 1; // +1 для текущей сессии
+        if total > self.max_sessions {
+            let to_remove = total - self.max_sessions;
+            let mut session_ids: Vec<Uuid> = self.session_history.keys().copied().collect();
+            session_ids.sort_by_key(|id| {
+                self.session_history.get(id)
+                    .map(|s| s.updated_at)
+                    .unwrap_or_else(Utc::now)
+            });
+
+            for id in session_ids.into_iter().take(to_remove) {
+                self.session_history.remove(&id);
+                self.vector_store.clear_by_type(&MemoryType::Episodic {
+                    session_id: id,
+                    turn: 0,
+                });
+                eprintln!("DEBUG: Removed old session {} to free memory", id);
+            }
+        }
     }
 
     /// Ищет похожие диалоги по запросу
