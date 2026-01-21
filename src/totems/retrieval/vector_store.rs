@@ -141,12 +141,6 @@ impl VectorStore {
             return Vec::new();
         }
 
-        eprintln!(
-            "DEBUG search_by_type: entries.len() = {}, dimension = {}",
-            self.entries.len(),
-            self.dimension
-        );
-
         // Фильтруем по типу памяти
         let filtered_entries: Vec<&MemoryEntry> = self
             .entries
@@ -159,19 +153,10 @@ impl VectorStore {
             })
             .collect();
 
-        eprintln!(
-            "DEBUG search_by_type: filtered_entries.len() = {}",
-            filtered_entries.len()
-        );
-
         let mut similarities: Vec<(f32, &MemoryEntry)> = filtered_entries
             .iter()
             .map(|entry| {
                 let similarity = cosine_similarity(query_embedding, &entry.embedding);
-                eprintln!(
-                    "DEBUG search_by_type: similarity = {:.4}, text = {}",
-                    similarity, entry.text
-                );
                 (similarity, *entry)
             })
             .collect();

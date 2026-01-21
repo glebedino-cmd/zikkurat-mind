@@ -7,6 +7,7 @@ mod logos;
 mod priests;
 mod totems;
 mod utils;
+mod demiurge;
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
@@ -24,7 +25,9 @@ use crate::priests::embeddings::{Embedder, EmbeddingEngine};
 use crate::totems::episodic::DialogueManager;
 use crate::totems::semantic::{SemanticMemoryManager};
 use crate::totems::semantic::concept::ConceptCategory;
+use crate::totems::semantic::persistence::SemanticPersistenceManager;
 use crate::utils::hub_load_safetensors;
+use crate::demiurge::{Persona, ArchetypeLoader, persona::PersonaInfo};
 
 const DEFAULT_SAMPLE_LEN: usize = 2048;
 
@@ -42,28 +45,42 @@ impl totems::semantic::ConceptExtractor for ConceptExtractorImpl {
     fn extract(
         &mut self,
         user_query: &str,
-        assistant_response: &str,
+        _assistant_response: &str,
         _session_id: &str,
     ) -> Result<totems::semantic::ExtractionResult> {
         let prompt = format!(
-            r#"<s>[INST] You are a knowledge extraction assistant. Extract facts, preferences, rules, skills from the dialogue below.
+            r#"<s>[INST] You are a knowledge extraction assistant. Extract ONLY explicit self-disclosed facts, preferences, rules, or skills that the USER directly states about themselves.
 
-Return ONLY a JSON array. Each object must have:
-- "text": concise knowledge statement (max 100 chars)
-- "category": one of facts, rules, preferences, skills, general
-- "confidence": float between 0.0 and 1.0
+CRITICAL RULES FOR RUSSIAN:
+- "я люблю X" = "I love X" (POSITIVE - extract!)
+- "я не люблю X" = "I don't love X" (NEGATIVE - extract!)
+- "нет, я люблю X" = "I love X" (CORRECTION - still POSITIVE, extract!)
+- "нет я люблю X" = "I love X" (CORRECTION - still POSITIVE, extract!)
+- "я предпочитаю X" = "I prefer X" (POSITIVE)
+- "мне нравится X" = "I like X" (POSITIVE)
 
-If no knowledge found, return empty array [].
+KEY PATTERNS TO DETECT:
+- "люблю" = love (POSITIVE)
+- "нравится" = like (POSITIVE)
+- "предпочитаю" = prefer (POSITIVE)
+- "не люблю" = don't love (NEGATIVE)
+- "не нравится" = don't like (NEGATIVE)
 
-Dialogue:
-User: {user_query}
-Assistant: {assistant_response}
+Examples:
+- "я люблю пиццу" → {{"text":"I love pizza","category":"preferences","confidence":0.9}}
+- "я не люблю суши" → {{"text":"I don't love sushi","category":"preferences","confidence":0.9}}
+- "нет я люблю суши" → {{"text":"I love sushi","category":"preferences","confidence":0.9}}
+- "предпочитаю кофе" → {{"text":"I prefer coffee","category":"preferences","confidence":0.9}}
+
+If no explicit self-disclosure found, return empty array [].
+
+User message:
+{user_query}
 
 Output format: [{{"text":"...","category":"...","confidence":0.8}}]
 NO markdown, NO explanations, NO text before or after. Only JSON.
 [/INST]</s>"#,
-            user_query = user_query,
-            assistant_response = assistant_response
+            user_query = user_query
         );
 
         let response = {
@@ -86,13 +103,24 @@ NO markdown, NO explanations, NO text before or after. Only JSON.
 
         let concepts: Vec<serde_json::Value> = match parse_json(&cleaned) {
             Ok(c) => c,
-            Err(e) => {
-                eprintln!("DEBUG: Direct JSON parse failed: {}", e);
-                let without_brackets = cleaned.trim_start_matches('[').trim_end_matches(']');
-                match parse_json(&format!("[{}]", without_brackets)) {
+            Err(_) => {
+                let mut fixed = cleaned.clone();
+
+                if !fixed.starts_with('[') {
+                    fixed = format!("[{}]", fixed);
+                }
+
+                if fixed.starts_with("[,\"") || fixed.starts_with("[\"") {
+                    fixed = fixed.replacen("[\"", "[{\"", 1);
+                }
+
+                fixed = fixed.replace("}\"]", "}\"]}");
+                fixed = fixed.replace("} ]", "}]");
+                fixed = fixed.replace("}] ]", "}]}]");
+
+                match parse_json(&fixed) {
                     Ok(c) => c,
-                    Err(e2) => {
-                        eprintln!("DEBUG: Bracket-wrapped parse also failed: {} | Input: {}", e2, cleaned);
+                    Err(_) => {
                         return Ok(Vec::new());
                     }
                 }
@@ -124,6 +152,24 @@ NO markdown, NO explanations, NO text before or after. Only JSON.
     }
 }
 
+struct ContextAnalyzerImpl {
+    pipeline: std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>,
+}
+
+impl ContextAnalyzerImpl {
+    fn new(pipeline: std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>) -> Self {
+        Self { pipeline }
+    }
+}
+
+impl totems::episodic::LlmPipeline for ContextAnalyzerImpl {
+    fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
+        let mut pipeline = self.pipeline.lock().unwrap();
+        pipeline.clear_cache();
+        pipeline.run(prompt, max_tokens, 0)
+    }
+}
+
 struct UnifiedPipeline {
     model: Mistral,
     tokenizer: Tokenizer,
@@ -131,6 +177,9 @@ struct UnifiedPipeline {
     logits_processor: LogitsProcessor,
     repeat_penalty: f32,
     repeat_last_n: usize,
+    temperature: f64,
+    top_k: Option<usize>,
+    top_p: Option<f64>,
 }
 
 impl UnifiedPipeline {
@@ -170,7 +219,20 @@ impl UnifiedPipeline {
             logits_processor,
             repeat_penalty,
             repeat_last_n,
+            temperature,
+            top_k,
+            top_p,
         }
+    }
+
+    /// Update temperature for generation
+    pub fn set_temperature(&mut self, temp: f64) {
+        self.temperature = temp;
+    }
+
+    /// Get current temperature
+    pub fn get_temperature(&self) -> f64 {
+        self.temperature
     }
 
     fn run(&mut self, prompt: &str, sample_len: usize, seed: u64) -> Result<String> {
@@ -181,19 +243,22 @@ impl UnifiedPipeline {
             .get_ids()
             .to_vec();
 
-        eprintln!("DEBUG: Input tokens count: {}", tokens.len());
-
         let mut generated_tokens = 0usize;
         let eos_token = match self.tokenizer.get_vocab(false).get("</s>") {
             Some(&t) => t,
             None => 2,
         };
 
-        let temperature = 0.;
+        let temperature = self.temperature;
         let sampling = if temperature <= 0. {
             Sampling::ArgMax
         } else {
-            Sampling::All { temperature }
+            match (self.top_k, self.top_p) {
+                (None, None) => Sampling::All { temperature },
+                (Some(k), None) => Sampling::TopK { k, temperature },
+                (None, Some(p)) => Sampling::TopP { p, temperature },
+                (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+            }
         };
         let _logits_processor = LogitsProcessor::from_sampling(seed, sampling);
 
@@ -298,6 +363,10 @@ struct Args {
     #[arg(long)]
     disable_memory_context: bool,
 
+    /// Quiet mode - suppress debug output
+    #[arg(long, short = 'q')]
+    quiet: bool,
+
     /// Number of similar dialogues to retrieve
     #[arg(long, default_value_t = 5)]
     memory_top_k: usize,
@@ -309,6 +378,10 @@ struct Args {
     /// Persona name for the session
     #[arg(long, default_value = "assistant")]
     persona: String,
+
+    /// Archetype to use (girlfriend, programmer, devops, scientist, philosopher)
+    #[arg(long, default_value = "programmer")]
+    archetype: String,
 
     /// Model ID to use
     #[arg(long)]
@@ -357,14 +430,15 @@ fn get_gpu_memory_mb() -> Option<u64> {
 }
 
 fn log_memory_usage(_label: &str) {
-    let mem_mb = get_memory_mb();
-    if mem_mb > 0 {
-        eprintln!("DEBUG [{}]: RAM: {} MB", _label, mem_mb);
+        // Debug memory info - uncomment if needed for debugging
+        // let mem_mb = get_memory_mb();
+        // if mem_mb > 0 {
+        //     eprintln!("DEBUG [{}]: RAM: {} MB", _label, mem_mb);
+        // }
+        // if let Some(gpu_mb) = get_gpu_memory_mb() {
+        //     eprintln!("DEBUG [{}]: VRAM: {} MB", _label, gpu_mb);
+        // }
     }
-    if let Some(gpu_mb) = get_gpu_memory_mb() {
-        eprintln!("DEBUG [{}]: VRAM: {} MB", _label, gpu_mb);
-    }
-}
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
@@ -394,11 +468,17 @@ fn build_prompt_with_context(
     semantic_context: &str,
     current_context: &str,
     enable_memory: bool,
+    persona: Option<&Persona>,
+    user_uses_formal: bool,
 ) -> String {
-    if !enable_memory || (episodic_context.is_empty() && semantic_context.is_empty() && current_context.is_empty()) {
-        return format!("[INST] {} [/INST]", user_input);
+    let mut prompt_parts = Vec::new();
+
+    // Add Persona system prompt if available
+    if let Some(p) = persona {
+        prompt_parts.push(p.format_system_prompt());
     }
 
+    // Build context sections
     let mut context_parts = Vec::new();
 
     if !current_context.is_empty() {
@@ -410,53 +490,215 @@ fn build_prompt_with_context(
     }
 
     if !episodic_context.is_empty() {
-        context_parts.push(format!("RELATED MEMORY:\n{}", episodic_context));
+        context_parts.push(format!(
+            "═══════════════════════════════════════════════════════════════\n\
+             PREVIOUS CONVERSATION MEMORY (CRITICAL - YOU MUST USE THIS!)\n\
+             ═══════════════════════════════════════════════════════════════\n{}\n\
+             ═══════════════════════════════════════════════════════════════\n\
+             INSTRUCTIONS:\n\
+             1. If user asks about preferences, past conversations, or remembers something - ANSWER directly using this memory\n\
+             2. If user asks \"what did I say about X\" - find it in this memory and repeat\n\
+             3. If memory contains the answer, say it clearly: \"You said [specific thing]\"\n\
+             4. Do NOT say \"I don't know\" if the answer is in this memory!\n\
+             ═══════════════════════════════════════════════════════════════",
+            episodic_context
+        ));
     }
 
-    let combined_context = context_parts.join("\n\n");
+    // Add relationship context if persona is available
+    if let Some(p) = persona {
+        let relationship_summary = p.narrative.format_relationship_summary("default_user");
+        if !relationship_summary.is_empty() {
+            context_parts.push(format!("RELATIONSHIP:\n{}", relationship_summary));
+        }
+    }
 
-    format!(
-        "[INST] {} [/INST]\n\n{}",
-        user_input, combined_context
-    )
+    if !context_parts.is_empty() {
+        prompt_parts.push(context_parts.join("\n\n"));
+    }
+
+    // Add directives as constraints
+    if let Some(p) = persona {
+        // Build directive constraints based on communication style
+        let mut constraints = Vec::new();
+
+        // Honorifics constraint
+        if p.communication.use_honorifics || user_uses_formal {
+            constraints.push("Обращаться на Вы");
+        } else {
+            constraints.push("Обращаться на ты");
+        }
+
+        // Style-based constraints
+        match p.communication.style.as_str() {
+            "technical" => constraints.push("Давать технически точные ответы с примерами кода"),
+            "warm" => constraints.push("Отвечать тепло и поддерживающе"),
+            "academic" => constraints.push("Отвечать академично, с данными и фактами"),
+            "socratic" => constraints.push("Использовать вопросы для направления мысли"),
+            _ => {}
+        }
+
+        // Trait-based constraints
+        let traits = p.get_all_traits();
+        if traits.get("pedagogical").unwrap_or(&0.5) > &0.7 {
+            constraints.push("Объяснять подробно и понятно");
+        }
+        if traits.get("humor").unwrap_or(&0.5) > &0.7 {
+            constraints.push("Добавлять юмор в ответы");
+        }
+        if traits.get("empathy").unwrap_or(&0.5) > &0.8 {
+            constraints.push("Проявлять эмпатию и понимание");
+        }
+
+        if !constraints.is_empty() {
+            prompt_parts.push(format!("STYLE CONSTRAINTS:\n{}", constraints.join("\n")));
+        }
+
+        // Add user's known preferences and facts from semantic memory
+        let user_knowledge = p.get_user_knowledge_summary();
+        if !user_knowledge.is_empty() {
+            prompt_parts.push(format!("USER PROFILE (use when relevant):\n{}", user_knowledge));
+        }
+    }
+
+    let combined_context = prompt_parts.join("\n\n");
+
+    if !enable_memory && persona.is_none() {
+        format!("<s>[INST] {} [/INST]", user_input)
+    } else if combined_context.is_empty() {
+        // No context - just be a friendly assistant
+        format!(
+            "<s>[INST] You are {}, {}.\n\
+             \n\
+             {}\
+             \n\
+             User: {}\n\
+             \n\
+             Respond naturally and helpfully.[/INST]",
+            persona.map(|p| p.name.as_str()).unwrap_or("a helpful assistant"),
+            persona.map(|p| p.description.as_str()).unwrap_or("friendly and supportive"),
+            persona.map(|p| p.communication.greeting.as_str()).unwrap_or(""),
+            user_input
+        )
+    } else {
+        // Has context - user asked about past
+        format!(
+            "<s>[INST] You are {}, {}.\n\
+             \n\
+             IMPORTANT: The user is asking about their own preferences or past statements from earlier conversations.\n\
+             \n\
+             PAST MEMORY:\n{}\n\
+             \n\
+             {}\
+             \n\
+             YOUR TASK: Read the memory above and give a CONFIDENT, DIRECT answer.\n\
+             - The user is asking about THEIR preferences, not yours\n\
+             - Look for \"USER SAID: ...\" to find what they previously stated\n\
+             - Answer clearly: \"Your favorite car is Lamborghini\" or \"You said your favorite food is sushi\"\n\
+             - Do NOT say \"I don't know\" if the memory contains relevant information\n\
+             - Be specific and confident\n\
+             \n\
+             User's question: {}\n\
+             \n\
+             Your confident answer:[/INST]",
+            persona.map(|p| p.name.as_str()).unwrap_or("a helpful assistant"),
+            persona.map(|p| p.description.as_str()).unwrap_or("friendly and supportive"),
+            combined_context,
+            persona.map(|p| p.communication.greeting.as_str()).unwrap_or(""),
+            user_input
+        )
+    }
 }
 
 fn process_query(
     prompt: &str,
     pipeline_arc: &std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>,
     dialogue_manager: &mut Option<DialogueManager>,
-    semantic_manager: &mut Option<std::sync::Mutex<SemanticMemoryManager>>,
+    semantic_manager: &mut Option<std::sync::Arc<std::sync::Mutex<SemanticMemoryManager>>>,
     persistence_manager: &std::sync::Arc<totems::episodic::persistence::PersistenceManager>,
     embedder: &Arc<dyn crate::priests::embeddings::Embedder>,
     args: &Args,
+    persona: &mut Option<Persona>,
 ) -> Result<()> {
     log_memory_usage("process_query start");
+
+    // Detect if user uses formal or informal address
+    let user_uses_formal = prompt.contains("Вы ") || prompt.contains("вы ") || prompt.contains("ВЫ ");
+
+    // Get sampling parameters from Persona traits
+    let (temperature, max_tokens) = if let Some(ref p) = *persona {
+        let traits = p.get_all_traits();
+
+        // Temperature: analytical = lower temp, creative = higher
+        let temp = traits.get("analytical").copied().unwrap_or(0.5);
+        let temperature = if temp > 0.8 {
+            0.3  // Analytical - precise
+        } else if temp > 0.6 {
+            0.5  // Balanced
+        } else {
+            0.7  // Creative
+        };
+
+        // Max tokens: verbose = longer, concise = shorter
+        let verbose = traits.get("verbose").copied().unwrap_or(0.5);
+        let max_tokens = if verbose > 0.7 {
+            (args.sample_len as f32 * 0.5) as usize
+        } else {
+            (args.sample_len as f32 * 0.25) as usize
+        };
+
+        (Some(temperature), max_tokens.min(512)) // Cap at 512 tokens for interactive mode
+    } else {
+        // For interactive mode without persona, limit to 512 tokens
+        let max_tokens = if args.interactive {
+            (args.sample_len as f32 * 0.25) as usize
+        } else {
+            args.sample_len
+        };
+        (None, max_tokens.min(512))
+    };
 
     let (similar_dialogues, current_context) = if let Some(ref mut dm) = *dialogue_manager {
         if args.disable_memory_context {
             (String::new(), String::new())
         } else {
-            let similar = dm.find_similar_dialogues(prompt, args.memory_top_k)?;
-            eprintln!("DEBUG: Found {} similar dialogues", similar.len());
+            // Only search memory if user is asking about past conversations
+            let is_asking_about_past = prompt.to_lowercase().contains("помнишь")
+                || prompt.to_lowercase().contains("помнил")
+                || prompt.to_lowercase().contains("вспомни")
+                || prompt.to_lowercase().contains("что я говорил")
+                || prompt.to_lowercase().contains("что я сказал")
+                || prompt.to_lowercase().contains("наш разговор")
+                || prompt.to_lowercase().contains("прошлый раз")
+                || prompt.to_lowercase().contains("в прошлый раз")
+                || prompt.to_lowercase().contains("раньше")
+                || prompt.to_lowercase().contains("забыл")
+                || prompt.to_lowercase().contains("в прошлом")
+                || prompt.to_lowercase().contains("что ты помнишь")
+                || prompt.to_lowercase().contains("ты помнишь")
+                || prompt.to_lowercase().contains("remember")
+                || prompt.to_lowercase().contains("what did i say")
+                || prompt.to_lowercase().contains("what did i tell");
 
-            let current_ctx = dm.get_current_context(5);
-            eprintln!(
-                "DEBUG: Current session context length: {}",
-                current_ctx.len()
-            );
-
-            let similar_text = if !similar.is_empty() {
-                println!("🧠 Found {} relevant memory entries", similar.len());
-                let truncated: Vec<String> = similar
-                    .iter()
-                    .map(|s| truncate_text(s, MAX_DIALOGUE_LENGTH))
-                    .collect();
-                truncated.join("\n\n")
+            if !is_asking_about_past {
+                // Don't include memory context for normal conversation
+                (String::new(), String::new())
             } else {
-                String::new()
-            };
+                let similar = dm.find_similar_dialogues(prompt, args.memory_top_k)?;
+                let current_ctx = dm.get_current_context(5);
 
-            (similar_text, current_ctx)
+                let similar_text = if !similar.is_empty() {
+                    let truncated: Vec<String> = similar
+                        .iter()
+                        .map(|s| truncate_text(s, MAX_DIALOGUE_LENGTH))
+                        .collect();
+                    truncated.join("\n\n")
+                } else {
+                    String::new()
+                };
+
+                (similar_text, current_ctx)
+            }
         }
     } else {
         (String::new(), String::new())
@@ -467,7 +709,9 @@ fn process_query(
             let sm = sm.lock().unwrap();
             let results = sm.search_by_text(prompt, args.semantic_top_k);
             if !results.is_empty() {
-                println!("📚 Found {} relevant concepts", results.len());
+                if !args.quiet {
+                    eprintln!("📚 Found {} relevant concepts", results.len());
+                }
                 let context: Vec<String> = results
                     .iter()
                     .map(|(sim, concept)| {
@@ -491,14 +735,39 @@ fn process_query(
         &semantic_context,
         &current_context,
         args.enable_memory || args.enable_semantic,
+        persona.as_ref(),
+        user_uses_formal,
     );
 
-    eprintln!("DEBUG: Enhanced prompt length: {}", enhanced_prompt.len());
+    if !args.quiet {
+        eprintln!("DEBUG: Enhanced prompt length: {}", enhanced_prompt.len());
+    }
 
-    println!("\n📝 User: {}", prompt);
-    println!("\n🤖 Assistant:");
+    println!("\n📝 You: {}", prompt);
 
-    let response = pipeline_arc.lock().unwrap().run(&enhanced_prompt, args.sample_len, args.seed)?;
+    // Show which persona is responding
+    if let Some(ref p) = *persona {
+        println!("\n🤖 {}:", p.name);
+    } else {
+        println!("\n🤖 Assistant:");
+    }
+
+    // Apply trait-based sampling parameters
+    {
+        let mut pipeline = pipeline_arc.lock().unwrap();
+        if let Some(temp) = temperature {
+            // Temporarily modify temperature for this generation
+            pipeline.set_temperature(temp);
+        }
+    }
+
+    let response = pipeline_arc.lock().unwrap().run(&enhanced_prompt, max_tokens, args.seed)?;
+
+    // Reset temperature if we changed it
+    {
+        let mut pipeline = pipeline_arc.lock().unwrap();
+        pipeline.set_temperature(args.temperature);
+    }
 
     println!("{}", response);
 
@@ -509,11 +778,11 @@ fn process_query(
 
     if let Some(ref mut dm) = *dialogue_manager {
         dm.add_exchange(prompt.to_string(), response.clone())?;
-        let stats = dm.stats();
-        println!(
-            "\n💾 Memory: {} turns in current session",
-            stats.current_session_turns
-        );
+
+        if args.interactive && !args.quiet {
+            let stats = dm.stats();
+            eprintln!("💾 Memory: {} turns in current session", stats.current_session_turns);
+        }
 
         if let Err(e) = persistence_manager.save_with_embeddings(dm, embedder.embedding_dim()) {
             eprintln!("WARNING: Failed to save memory: {}", e);
@@ -523,10 +792,60 @@ fn process_query(
     if args.enable_semantic {
         if let Some(ref sm) = *semantic_manager {
             let mut sm = sm.lock().unwrap();
-            if let Err(e) = sm.extract_from_dialogue(prompt, &response, &session_id) {
-                eprintln!("DEBUG: Failed to extract concepts: {}", e);
+            let has_self_disclosure = prompt.to_lowercase().contains("я ")
+                || prompt.to_lowercase().contains("мой ")
+                || prompt.to_lowercase().contains("моя ")
+                || prompt.to_lowercase().contains("моё ")
+                || prompt.to_lowercase().contains("мои ")
+                || prompt.to_lowercase().contains("люблю")
+                || prompt.to_lowercase().contains("предпочитаю")
+                || prompt.to_lowercase().contains("нравится")
+                || prompt.to_lowercase().contains("не люблю")
+                || prompt.to_lowercase().contains("i ")
+                || prompt.to_lowercase().contains("my ")
+                || prompt.to_lowercase().contains("i'm")
+                || prompt.to_lowercase().contains("i am");
+
+            if has_self_disclosure {
+                if let Err(e) = sm.extract_from_dialogue(prompt, &response, &session_id) {
+                    if !args.quiet {
+                        eprintln!("DEBUG: Failed to extract concepts: {}", e);
+                    }
+                }
+                if !args.quiet {
+                    eprintln!("DEBUG: Semantic memory now has {} concepts", sm.count());
+                }
             }
-            eprintln!("DEBUG: Semantic memory now has {} concepts", sm.count());
+        }
+    }
+
+    // Apply Persona evolution based on interaction
+    if let Some(ref mut p) = *persona {
+        // Create interaction record
+        let interaction = crate::demiurge::Interaction {
+            user_sentiment: 0.5,  // Would need sentiment analysis to determine
+            successful_help: true,  // Assuming response was generated
+            emotional_depth: if prompt.contains("?") || prompt.len() > 100 { 0.5 } else { 0.3 },
+            topics: vec!["general".to_string()],
+            user_gave_feedback: false,
+            feedback_positive: false,
+            is_deep_conversation: prompt.len() > 200,
+            is_code_related: prompt.contains("code") || prompt.contains("function") || prompt.contains("bug"),
+            is_emotional_support: prompt.contains("sad") || prompt.contains("help") || prompt.contains("помоги"),
+        };
+
+        p.apply_interaction(interaction);
+
+        // Extract and store concepts in Persona semantic memory
+        p.extract_and_store_concepts(prompt, &response);
+
+        // Save narrative periodically (every 10 interactions)
+        if p.evolution.interactions_count % 10 == 0 {
+            if let Err(e) = p.save_narrative() {
+                eprintln!("WARNING: Failed to save narrative: {}", e);
+            } else {
+                eprintln!("💾 Persona narrative saved");
+            }
         }
     }
 
@@ -589,40 +908,70 @@ fn main() -> Result<()> {
         embedder.embedding_dim()
     );
 
-    // Инициализируем persistence manager
-    let persistence_manager = std::sync::Arc::new(
-        totems::episodic::persistence::PersistenceManager::new(Some(&resolve_path("")), true)?,
-    );
-
-    let mut dialogue_manager = if args.enable_memory {
-        match persistence_manager.load_with_embeddings(embedder.clone(), args.persona.clone())? {
-            Some((manager, sessions)) => {
-                println!("💾 Loaded {} saved sessions", sessions.len());
-                let stats = manager.stats();
-                println!("📊 Vector store: {} entries", stats.total_turns);
-                Some(manager)
-            }
-            None => Some(DialogueManager::new(embedder.clone(), args.persona.clone())),
-        }
-    } else {
-        None
-    };
-
-    let mut semantic_manager = if args.enable_semantic {
-        let semantic_persistence = totems::semantic::persistence::SemanticPersistenceManager::new(
+    // Initialize managers
+    let persistence_manager = Arc::new(
+        totems::episodic::persistence::PersistenceManager::new(
             Some(&resolve_path("memory_data")),
-        )?;
-        let sm = SemanticMemoryManager::new(embedder.clone(), semantic_persistence)?;
-        let count = sm.count();
-        if count > 0 {
-            println!("📚 Loaded {} semantic concepts", count);
-        }
-        Some(std::sync::Mutex::new(sm))
+            true,
+        )?
+    );
+    println!("💾 Persistence manager initialized");
+
+    let mut dialogue_manager: Option<DialogueManager> = None;
+    if args.enable_memory {
+        let persona_name = args.archetype.clone();
+        dialogue_manager = Some(DialogueManager::new(embedder.clone(), persona_name));
+        println!("🗣️ Dialogue memory enabled");
+    }
+
+    let mut semantic_manager: Option<std::sync::Arc<std::sync::Mutex<SemanticMemoryManager>>> = if args.enable_semantic {
+        let storage_path = resolve_path("memory_data/semantic");
+        let persistence = SemanticPersistenceManager::new(Some(&storage_path))?;
+        let sm = SemanticMemoryManager::new(embedder.clone(), persistence)?;
+        Some(std::sync::Arc::new(std::sync::Mutex::new(sm)))
     } else {
         None
     };
+    if args.enable_semantic {
+        println!("🧠 Semantic memory enabled");
+    }
 
-    println!("🤖 Loading Mistral 7B...");
+    // Инициализируем Persona (Demiurge Level)
+    let mut persona: Option<Persona> = None;
+    if args.interactive {
+        match ArchetypeLoader::load(&args.archetype) {
+            Ok(archetype) => {
+                let mut p = Persona::from_archetype(std::sync::Arc::new(archetype));
+                println!("🎭 Persona loaded: {} ({})", p.name, p.archetype_id);
+
+                // Connect semantic memory if enabled
+                if args.enable_semantic {
+                    if let Some(ref sm) = semantic_manager {
+                        p.set_semantic_manager(sm.clone());
+                        println!("🧠 Connected semantic memory to persona");
+                    }
+                }
+
+                if let Some(context) = p.load_session_context()? {
+                    println!("💭 Found saved session context!");
+
+                    if !context.summary.is_empty() {
+                        let greeting = p.generate_contextual_greeting(&context);
+                        println!("\n🤖 {}:", p.name);
+                        println!("{}", greeting);
+                    }
+                } else if p.has_saved_context() {
+                    println!("💭 Found expired session context (will be cleared)");
+                }
+
+                persona = Some(p);
+            }
+            Err(e) => {
+                eprintln!("⚠️  Warning: Could not load archetype '{}': {}", args.archetype, e);
+                eprintln!("   Available archetypes: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
+            }
+        }
+    }
 
     // Show device selection status
     if device.is_cuda() {
@@ -653,7 +1002,6 @@ fn main() -> Result<()> {
         std::path::PathBuf,
     ) = if use_local_path {
         let local_path = local_mistral_path.clone();
-        eprintln!("DEBUG: Loading from local path: {:?}", local_path);
 
         let tokenizer = Tokenizer::from_file(local_path.join("tokenizer.json")).map_err(E::msg)?;
 
@@ -805,9 +1153,40 @@ fn main() -> Result<()> {
     }
 
     if args.interactive {
+        let pipeline_for_context = pipeline_arc.clone();
+        let persona_for_save = persona.clone();
+        let dm_for_save = dialogue_manager.clone();
+        let persistence_for_save = persistence_manager.clone();
+        let embedder_for_save = embedder.clone();
+
+        let _ = ctrlc::set_handler(move || {
+            println!("\n\n💾 Saving context before exit...");
+
+            if let Some(ref p) = persona_for_save {
+                if let Some(ref dm) = dm_for_save {
+                    let context_analyzer = ContextAnalyzerImpl::new(pipeline_for_context.clone());
+                    if let Ok(Some(_)) = p.save_session_context(dm, &context_analyzer) {
+                        println!("💾 Session context saved");
+                    }
+                }
+            }
+
+            if let Some(ref dm) = dm_for_save {
+                if let Err(e) = persistence_for_save.save_with_embeddings(dm, embedder_for_save.embedding_dim()) {
+                    eprintln!("WARNING: Failed to save memory: {}", e);
+                } else {
+                    println!("💾 Episodic memory saved");
+                }
+            }
+
+            std::process::exit(0);
+        });
+
         println!("\n🗣️ Interactive mode - type 'quit' to exit");
         println!("   /semantic - Manage semantic memory");
+        println!("   /persona  - Manage persona (show, switch, traits, evolution)");
         println!("   /mem - Show memory usage");
+        println!("   /context - Show current session context");
         println!("========================================");
 
         if let Some(ref initial_prompt) = args.prompt {
@@ -820,6 +1199,7 @@ fn main() -> Result<()> {
                 &persistence_manager,
                 &embedder,
                 &args,
+                &mut persona,
             )?;
         }
 
@@ -835,14 +1215,27 @@ fn main() -> Result<()> {
                 continue;
             }
             if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
-                // Сохраняем память перед выходом
+                println!("💾 Saving session context...");
+
+                if let Some(ref p) = persona {
+                    if let Some(ref dm) = dialogue_manager {
+                        let context_analyzer = ContextAnalyzerImpl::new(pipeline_arc.clone());
+                        if let Ok(Some(context)) = p.save_session_context(dm, &context_analyzer) {
+                            println!("💾 Context saved for next session");
+                            if !context.summary.is_empty() {
+                                println!("   Topics: {}", context.key_topics.join(", "));
+                            }
+                        }
+                    }
+                }
+
                 if let Some(ref dm) = dialogue_manager {
                     if let Err(e) =
                         persistence_manager.save_with_embeddings(dm, embedder.embedding_dim())
                     {
                         eprintln!("WARNING: Failed to save memory on exit: {}", e);
                     } else {
-                        println!("💾 Episodic memory saved to disk");
+                        println!("💾 Episodic memory saved");
                     }
                 }
                 if let Some(ref sm) = semantic_manager {
@@ -882,6 +1275,57 @@ fn main() -> Result<()> {
                 continue;
             }
 
+            if input == "/context" || input == "/c" {
+                if let Some(ref mut p) = persona {
+                    match p.load_session_context() {
+                        Ok(Some(context)) => {
+                            println!("\n💭 Session Context:");
+                            println!("   Version: {}", context.version);
+                            println!("   Last interaction: <timestamp>");
+
+                            if !context.summary.is_empty() {
+                                println!("   Summary: {}", context.summary);
+                            }
+
+                            if !context.key_topics.is_empty() {
+                                println!("   Topics: {}", context.key_topics.join(", "));
+                            }
+
+                            println!("   Emotional state: {:.1}", context.emotional_state);
+
+                            if !context.last_topic.is_empty() {
+                                println!("   Last topic: {}", context.last_topic);
+                            }
+
+                            if !context.pending_questions.is_empty() {
+                                println!("   Pending questions:");
+                                for q in &context.pending_questions {
+                                    println!("     - {}", q);
+                                }
+                            }
+
+                            println!("\n   💡 This context will be restored in the next session.");
+                        }
+                        Ok(None) => {
+                            println!("\n💭 No saved context found.");
+                            println!("   Start a conversation to create context for the next session.");
+                        }
+                        Err(e) => {
+                            println!("\n❌ Error loading context: {}", e);
+                        }
+                    }
+                } else {
+                    println!("\n💭 No persona loaded.");
+                }
+                continue;
+            }
+
+            // Persona commands
+            if input.starts_with("/persona") || input.starts_with("/p") {
+                handle_persona_command(input, &mut persona);
+                continue;
+            }
+
             if let Err(e) = process_query(
                 input,
                 &pipeline_arc,
@@ -890,6 +1334,7 @@ fn main() -> Result<()> {
                 &persistence_manager,
                 &embedder,
                 &args,
+                &mut persona,
             ) {
                 eprintln!("Error: {}", e);
             }
@@ -909,6 +1354,7 @@ fn main() -> Result<()> {
             &persistence_manager,
             &embedder,
             args_ref,
+            &mut persona,
         )?;
 
         // Сохраняем память после выполнения
@@ -957,9 +1403,9 @@ fn handle_semantic_command(input: &str, sm: &std::sync::Mutex<totems::semantic::
             let sm = sm.lock().unwrap();
             if parts.len() >= 3 {
                 let cat_arg = parts[2].to_lowercase();
-                let category = match cat_arg.as_str() {
+                match cat_arg.as_str() {
                     "facts" | "rules" | "preferences" | "pref" | "skills" | "general" => {
-                        let category = match cat_arg.as_str() {
+                        let cat = match cat_arg.as_str() {
                             "facts" => ConceptCategory::Facts,
                             "rules" => ConceptCategory::Rules,
                             "preferences" | "pref" => ConceptCategory::Preferences,
@@ -968,12 +1414,12 @@ fn handle_semantic_command(input: &str, sm: &std::sync::Mutex<totems::semantic::
                             _ => unreachable!()
                         };
                         let limit = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
-                        let concepts = sm.list_by_category(&category, limit);
-                        let total_in_cat = sm.get_concepts_by_category(&category).len();
+                        let concepts = sm.list_by_category(&cat, limit);
+                        let total_in_cat = sm.get_concepts_by_category(&cat).len();
                         if concepts.is_empty() {
-                            println!("No concepts found in category '{}'.", category);
+                            println!("No concepts found in category '{}'.", cat);
                         } else {
-                            println!("📚 Concepts in {} (showing {} of {}):", category, concepts.len(), total_in_cat);
+                            println!("📚 Concepts in {} (showing {} of {}):", cat, concepts.len(), total_in_cat);
                             for (i, c) in concepts.iter().enumerate() {
                                 println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
                             }
@@ -1147,5 +1593,184 @@ Categories: facts, rules, preferences, skills"#);
         _ => {
             println!("Unknown command: {}. Use /semantic help", command);
         }
+    }
+}
+
+fn handle_persona_command(input: &str, persona: &mut Option<Persona>) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let command = parts.get(1).map(|s| *s).unwrap_or("");
+
+    match command {
+        "help" | "h" => {
+            println!(r#"
+🎭 Persona Commands:
+   /persona help           - Show this help
+   /persona show           - Show current persona info
+   /persona list           - List available archetypes
+   /persona switch <name>  - Switch to another archetype
+   /persona traits         - Show current traits
+   /persona evolution      - Show evolution status
+   Short form: /p instead of /persona
+"#);
+        }
+
+        "list" | "l" => {
+            match ArchetypeLoader::list_ids() {
+                Ok(ids) => {
+                    if ids.is_empty() {
+                        println!("No archetypes found in config/archetypes/");
+                    } else {
+                        println!("🎭 Available archetypes:");
+                        for id in ids {
+                            println!("  - {}", id);
+                        }
+                    }
+                }
+                Err(e) => println!("Error loading archetypes: {}", e),
+            }
+        }
+
+        "show" | "" => {
+            if let Some(ref p) = persona {
+                let info: PersonaInfo = p.into();
+                println!("\n🎭 Current Persona:");
+                println!("   Name: {}", info.name);
+                println!("   Archetype: {}", info.archetype_id);
+                println!("   Description: {}", info.description);
+                println!("   Interactions: {}", info.evolution.interactions);
+                println!("   Relationship score: {:.2}", info.evolution.relationship_score);
+            } else {
+                println!("No persona loaded. Use --archetype in CLI args to enable.");
+            }
+        }
+
+        "switch" | "s" => {
+            if parts.len() < 3 {
+                println!("Usage: /persona switch <archetype>");
+                println!("Available archetypes: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
+                return;
+            }
+            let new_archetype = parts[2];
+            match ArchetypeLoader::load(new_archetype) {
+                Ok(archetype) => {
+                    let new_persona = Persona::from_archetype(std::sync::Arc::new(archetype));
+                    println!("✅ Switched to persona: {} ({})", new_persona.name, new_persona.archetype_id);
+                    *persona = Some(new_persona);
+                }
+                Err(e) => {
+                    println!("❌ Error loading archetype '{}': {}", new_archetype, e);
+                    println!("Available archetypes: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
+                }
+            }
+        }
+
+        "traits" | "t" => {
+            if let Some(ref p) = persona {
+                let traits = p.get_all_traits();
+                println!("\n📊 Current Traits:");
+                println!("┌─────────────────────┬────────┬─────────────┐");
+                println!("│ Trait               │ Value  │ Description │");
+                println!("├─────────────────────┼────────┼─────────────┤");
+                let mut trait_names: Vec<_> = traits.keys().collect();
+                trait_names.sort();
+                for name in trait_names {
+                    let value = traits[name];
+                    let bar = get_trait_bar(value);
+                    let desc = get_trait_description(name, value);
+                    println!("│ {:<19} │ {} │ {} │", name, bar, desc);
+                }
+                println!("└─────────────────────┴────────┴─────────────┘");
+            } else {
+                println!("No persona loaded.");
+            }
+        }
+
+        "evolution" | "e" | "unlocks" | "u" => {
+            if let Some(ref p) = persona {
+                let info: PersonaInfo = p.into();
+                println!("\n🌱 Evolution Status:");
+                println!("   Interactions: {}", info.evolution.interactions);
+                println!("   Relationship score: {:.2}", info.evolution.relationship_score);
+
+                if info.evolution.unlocked_traits.is_empty() {
+                    println!("   Unlocked traits: None (keep interacting to unlock!)");
+                } else {
+                    println!("   Unlocked traits: {:?}", info.evolution.unlocked_traits);
+                }
+
+                println!("\n📈 Relationship Arc:");
+                if info.evolution.relationship_score > 0.8 {
+                    println!("   💕 Deep connection established");
+                } else if info.evolution.relationship_score > 0.6 {
+                    println!("   🤝 Good working relationship");
+                } else if info.evolution.relationship_score > 0.4 {
+                    println!("   👋 Normal interaction");
+                } else {
+                    println!("   🆕 Just getting started");
+                }
+            } else {
+                println!("No persona loaded.");
+            }
+        }
+
+        _ => {
+            println!("Unknown command: {}. Use /persona help", command);
+        }
+    }
+}
+
+fn get_trait_bar(value: f32) -> String {
+    let filled = (value * 10.0) as usize;
+    let empty = 10 - filled;
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn get_trait_description(name: &str, value: f32) -> &'static str {
+    match name {
+        "analytical" if value > 0.8 => "Analytical",
+        "analytical" if value > 0.6 => "Logical",
+        "analytical" => "Balanced",
+
+        "empathy" if value > 0.8 => "Very Empathetic",
+        "empathy" if value > 0.6 => "Understanding",
+        "empathy" => "Neutral",
+
+        "humor" if value > 0.7 => "Playful",
+        "humor" if value > 0.5 => "Light",
+        "humor" => "Serious",
+
+        "pedagogical" if value > 0.7 => "Teacher-like",
+        "pedagogical" if value > 0.5 => "Helpful",
+        "pedagogical" => "Direct",
+
+        "technical" if value > 0.8 => "Expert",
+        "technical" if value > 0.6 => "Skilled",
+        "technical" => "Generalist",
+
+        "supportive" if value > 0.8 => "Very Supportive",
+        "supportive" if value > 0.6 => "Encouraging",
+        "supportive" => "Neutral",
+
+        "creative" if value > 0.7 => "Creative",
+        "creative" if value > 0.5 => "Inventive",
+        "creative" => "Practical",
+
+        "patient" if value > 0.8 => "Very Patient",
+        "patient" if value > 0.6 => "Calm",
+        "patient" => "Energetic",
+
+        "curious" if value > 0.8 => "Very Curious",
+        "curious" if value > 0.6 => "Inquisitive",
+        "curious" => "Focused",
+
+        "skeptical" if value > 0.7 => "Critical",
+        "skeptical" if value > 0.5 => "Questioning",
+        "skeptical" => "Trusting",
+
+        "formal" if value > 0.7 => "Formal",
+        "formal" if value > 0.4 => "Semi-formal",
+        "formal" => "Casual",
+
+        _ => "Balanced",
     }
 }

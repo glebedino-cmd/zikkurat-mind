@@ -12,6 +12,87 @@ use super::persistence::SemanticPersistenceManager;
 use crate::priests::embeddings::Embedder;
 use crate::totems::retrieval::vector_store::cosine_similarity;
 
+fn remove_negation(text: &str) -> String {
+    let mut result = text.to_string();
+    let negations = [
+        "don't ",
+        "don't ",
+        "doesn't ",
+        "didn't ",
+        "not ",
+        "n't ",
+        "не ",
+        "нельзя ",
+        "не люблю ",
+        "не нравится ",
+    ];
+    for neg in &negations {
+        result = result.replace(neg, "");
+    }
+    result.trim().to_string()
+}
+
+fn is_contradiction(text1: &str, text2: &str) -> bool {
+    let t1 = text1.to_lowercase();
+    let t2 = text2.to_lowercase();
+
+    let t1_neg = t1.contains("n't")
+        || t1.contains("not ")
+        || t1.contains("не ")
+        || t1.contains("нельзя")
+        || t1.contains("не люблю")
+        || t1.contains("не нравится");
+    let t2_neg = t2.contains("n't")
+        || t2.contains("not ")
+        || t2.contains("не ")
+        || t2.contains("нельзя")
+        || t2.contains("не люблю")
+        || t2.contains("не нравится");
+
+    if t1_neg != t2_neg {
+        let base1 = remove_negation(&t1);
+        let base2 = remove_negation(&t2);
+
+        let check_words = [
+            "love",
+            "loves",
+            "loved",
+            "люблю",
+            "любит",
+            "любил",
+            "like",
+            "likes",
+            "liked",
+            "нравится",
+            "нравилось",
+            "понравилось",
+            "prefer",
+            "prefers",
+            "preferred",
+            "предпочитаю",
+            "предпочитает",
+            "предпочитал",
+            "hate",
+            "hates",
+            "hated",
+            "ненавижу",
+            "ненавидит",
+            "ненавидел",
+            "enjoy",
+            "enjoys",
+            "enjoyed",
+        ];
+
+        let has_match1 = check_words.iter().any(|w| base1.contains(*w));
+        let has_match2 = check_words.iter().any(|w| base2.contains(*w));
+        if has_match1 && has_match2 {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub type ExtractionResult = Vec<(String, String, f32)>; // (text, category, confidence)
 
 pub trait ConceptExtractor: Send + Sync {
@@ -52,7 +133,6 @@ impl SemanticMemoryManager {
                 concept.embedding = manager.embedder.embed(&concept.text)?;
                 manager.concepts.insert(concept.id, concept);
             }
-            eprintln!("DEBUG: Loaded {} concepts from storage", count);
         }
 
         Ok(manager)
@@ -110,6 +190,66 @@ impl SemanticMemoryManager {
     ) -> Result<Concept> {
         let embedding = self.embedder.embed(&text)?;
 
+        let normalized_text = text.to_lowercase();
+
+        for existing in self.concepts.values() {
+            let existing_normalized = existing.text.to_lowercase();
+
+            let text_similarity = cosine_similarity(&embedding, &existing.embedding);
+
+            if text_similarity > 0.92 {
+                if normalized_text == existing_normalized {
+                    eprintln!(
+                        "DEBUG: Duplicate concept found '{}' (similarity: {:.2}), skipping",
+                        existing.text, text_similarity
+                    );
+                    return Ok(existing.clone());
+                }
+
+                if is_contradiction(&normalized_text, &existing_normalized) {
+                    eprintln!(
+                        "DEBUG: Contradiction detected: '{}' vs '{}', updating existing",
+                        text, existing.text
+                    );
+
+                    if confidence.unwrap_or(1.0) > existing.confidence {
+                        let mut updated = existing.clone();
+                        updated.text = text.clone();
+                        updated.confidence = confidence.unwrap_or(1.0);
+                        updated.embedding = embedding;
+                        updated.updated_at = chrono::Utc::now();
+                        updated.usage_count += 1;
+
+                        self.concepts.insert(updated.id, updated.clone());
+                        self.save()?;
+                        return Ok(updated);
+                    }
+                    return Ok(existing.clone());
+                }
+
+                if text_similarity > 0.85 && category == existing.category {
+                    eprintln!(
+                        "DEBUG: Similar concept found '{}' (similarity: {:.2}), merging",
+                        existing.text, text_similarity
+                    );
+
+                    if confidence.unwrap_or(0.5) > existing.confidence {
+                        let mut updated = existing.clone();
+                        updated.text = text.clone();
+                        updated.confidence = confidence.unwrap_or(1.0);
+                        updated.embedding = embedding;
+                        updated.updated_at = chrono::Utc::now();
+                        updated.usage_count += 1;
+
+                        self.concepts.insert(updated.id, updated.clone());
+                        self.save()?;
+                        return Ok(updated);
+                    }
+                    return Ok(existing.clone());
+                }
+            }
+        }
+
         let mut concept = Concept::new(text, category, source);
         if let Some(c) = confidence {
             concept = concept.with_confidence(c);
@@ -136,8 +276,7 @@ impl SemanticMemoryManager {
     ) -> Vec<(f32, &Concept)> {
         let query_embedding = match self.embedder.embed(query) {
             Ok(e) => e,
-            Err(e) => {
-                eprintln!("DEBUG: Failed to embed query: {}", e);
+            Err(_) => {
                 return Vec::new();
             }
         };
@@ -195,7 +334,6 @@ impl SemanticMemoryManager {
         let extractor = match &self.extractor {
             Some(e) => e,
             None => {
-                eprintln!("DEBUG: No extractor configured for semantic memory");
                 return Ok(Vec::new());
             }
         };
@@ -294,7 +432,6 @@ impl SemanticMemoryManager {
 
         if merged > 0 {
             self.save()?;
-            eprintln!("DEBUG: Merged {} duplicate concepts", merged);
         }
 
         Ok(merged)

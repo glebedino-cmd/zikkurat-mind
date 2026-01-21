@@ -149,14 +149,6 @@ impl PersistenceManager {
         fs::write(self.metadata_path(), metadata_content)
             .context("Failed to write metadata file")?;
 
-        eprintln!(
-            "DEBUG: Saved {} sessions ({} turns, dim={}) to {:?}",
-            storage.metadata.total_sessions,
-            storage.metadata.total_turns,
-            embedding_dim,
-            self.memory_dir
-        );
-
         Ok(())
     }
 
@@ -272,13 +264,6 @@ impl PersistenceManager {
         fs::write(self.embeddings_path(), file_content)
             .context("Failed to write embeddings file")?;
 
-        eprintln!(
-            "DEBUG: Saved {} embeddings ({:.2} KB) to {:?}",
-            index_data_len,
-            embeddings_data.len() as f32 * 4.0 / 1024.0,
-            self.embeddings_path()
-        );
-
         Ok(())
     }
 
@@ -319,11 +304,6 @@ impl PersistenceManager {
 
         self.load_embeddings_binary(&mut manager, dimension, &storage.sessions)?;
 
-        eprintln!(
-            "DEBUG: Loaded {} sessions ({} turns) with embeddings from {:?}",
-            storage.metadata.total_sessions, storage.metadata.total_turns, self.memory_dir
-        );
-
         Ok(Some((manager, storage.sessions)))
     }
 
@@ -335,13 +315,10 @@ impl PersistenceManager {
     ) -> Result<()> {
         let embeddings_path = self.embeddings_path();
         if !embeddings_path.exists() {
-            eprintln!("DEBUG: No embeddings file found");
             return Ok(());
         }
 
         let file_content = fs::read(&embeddings_path).context("Failed to read embeddings file")?;
-
-        eprintln!("DEBUG: Embeddings file size: {} bytes", file_content.len());
 
         if file_content.len() < std::mem::size_of::<EmbeddingsHeader>() {
             anyhow::bail!(
@@ -354,24 +331,13 @@ impl PersistenceManager {
         let header =
             EmbeddingsHeader::from_bytes(&file_content[..std::mem::size_of::<EmbeddingsHeader>()]);
 
-        eprintln!(
-            "DEBUG: Header - version: {}, dim: {}, num: {}, data_offset: {}",
-            header.version, header.embedding_dim, header.num_embeddings, header.data_offset
-        );
-
         let header_size = std::mem::size_of::<EmbeddingsHeader>();
         let index_size = std::mem::size_of::<EmbeddingIndex>();
         let expected_file_size =
             header.data_offset as usize + (header.num_embeddings as usize * embedding_dim * 4);
 
-        eprintln!(
-            "DEBUG: Expected file size: {} bytes (header: {}, index: {} entries, data: {} entries * {} dim * 4 bytes)",
-            expected_file_size, header_size, header.num_embeddings,
-            header.num_embeddings, embedding_dim
-        );
-
         if file_content.len() < expected_file_size {
-            eprintln!("DEBUG: File is smaller than expected, may be corrupted");
+            eprintln!("Warning: Embeddings file may be corrupted");
         }
 
         let index_start = std::mem::size_of::<EmbeddingsHeader>();
@@ -381,7 +347,6 @@ impl PersistenceManager {
         let mut loaded_count = 0;
         for _ in 0..header.num_embeddings {
             if offset + index_size > file_content.len() {
-                eprintln!("DEBUG: Index out of bounds at offset {}", offset);
                 break;
             }
 
@@ -392,12 +357,6 @@ impl PersistenceManager {
             let data_end = data_offset + (index.size as usize) * 4;
 
             if data_end > file_content.len() {
-                eprintln!(
-                    "DEBUG: Data out of bounds - offset: {}, end: {}, file_len: {}",
-                    data_offset,
-                    data_end,
-                    file_content.len()
-                );
                 offset += index_size;
                 continue;
             }
@@ -445,11 +404,6 @@ impl PersistenceManager {
             offset += index_size;
         }
 
-        eprintln!(
-            "DEBUG: Restored {} embeddings to vector store (expected: {})",
-            loaded_count, header.num_embeddings
-        );
-
         Ok(())
     }
 
@@ -463,11 +417,6 @@ impl PersistenceManager {
 
         let storage: MemoryStorage =
             serde_json::from_str(&content).context("Failed to deserialize sessions")?;
-
-        eprintln!(
-            "DEBUG: Loaded {} sessions ({} turns) from {:?}",
-            storage.metadata.total_sessions, storage.metadata.total_turns, self.memory_dir
-        );
 
         Ok(Some(storage.sessions))
     }

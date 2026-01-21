@@ -171,6 +171,18 @@ pub struct DialogueManager {
     max_sessions: usize,
 }
 
+impl Clone for DialogueManager {
+    fn clone(&self) -> Self {
+        Self {
+            current_session: self.current_session.clone(),
+            vector_store: self.vector_store.clone(),
+            embedder: self.embedder.clone(),
+            session_history: self.session_history.clone(),
+            max_sessions: self.max_sessions,
+        }
+    }
+}
+
 impl DialogueManager {
     /// Создает новый менеджер диалогов
     pub fn new(embedder: Arc<dyn Embedder>, persona_name: String) -> Self {
@@ -209,7 +221,6 @@ impl DialogueManager {
 
         let query_for_embedding = format!("User query: {}", user);
         let embedding = self.embedder.embed(&query_for_embedding)?;
-        eprintln!("DEBUG add_exchange: embedding.len() = {}", embedding.len());
 
         let memory_entry = MemoryEntry::new(
             user.clone(),
@@ -232,10 +243,6 @@ impl DialogueManager {
         .with_metadata("assistant_response".to_string(), assistant);
 
         self.vector_store.add(memory_entry)?;
-        eprintln!(
-            "DEBUG add_exchange: vector_store.len() = {}",
-            self.vector_store.len()
-        );
 
         self.cleanup_if_needed();
 
@@ -260,7 +267,6 @@ impl DialogueManager {
                     session_id: id,
                     turn: 0,
                 });
-                eprintln!("DEBUG: Removed old session {} to free memory", id);
             }
         }
     }
@@ -310,11 +316,21 @@ impl DialogueManager {
             }
             seen.insert(key);
 
+            // Only include high-similarity memories (above 0.3)
+            if similarity < 0.3 {
+                continue;
+            }
+
             let user_query = entry
                 .metadata
                 .get("user_query")
                 .cloned()
                 .unwrap_or_else(|| entry.text.clone());
+
+            // Skip test/placeholder entries
+            if user_query.contains("# Test") || user_query.contains("TEST") || user_query.is_empty() {
+                continue;
+            }
 
             let assistant_response = entry
                 .metadata
@@ -322,13 +338,13 @@ impl DialogueManager {
                 .cloned()
                 .unwrap_or_default();
 
-            let context = format!("User: {}\nAssistant: {}", user_query, assistant_response);
+            let context = format!("FROM PAST: User said \"{}\"", user_query);
 
             let truncated = if context.chars().count() > 200 {
                 if let Some((byte_pos, _)) = context.char_indices().nth(200) {
                     let trunc = &context[..byte_pos];
-                    if let Some(newline_pos) = trunc.rfind('\n') {
-                        &context[..newline_pos]
+                    if let Some(newline_pos) = trunc.rfind('"') {
+                        &context[..=newline_pos]
                     } else if let Some(space_pos) = trunc.rfind(' ') {
                         &context[..space_pos]
                     } else {
@@ -338,12 +354,13 @@ impl DialogueManager {
                     &context
                 }
                 .to_string()
-                    + "..."
+                    + "\"..."
             } else {
                 context
             };
 
-            let formatted = format!("[Similarity: {:.3}] {}", similarity, truncated);
+            let score_pct = (similarity * 100.0) as u32;
+            let formatted = format!("[Relevance: {}%] {}", score_pct, truncated);
             dialogues.push(formatted);
         }
 
@@ -508,6 +525,33 @@ impl DialogueManager {
 
         existed
     }
+
+    pub fn get_turns_for_context(&self, max_turns: usize) -> Vec<Turn> {
+        self.current_session.last_turns(max_turns).to_vec()
+    }
+
+    pub fn analyze_for_context(
+        &self,
+        pipeline: &dyn LlmPipeline,
+        max_turns: usize,
+    ) -> Result<SessionAnalysis> {
+        let turns = self.get_turns_for_context(max_turns);
+
+        let analyzer = ContextAnalyzer::new(pipeline);
+
+        let summary = analyzer.summarize_session(&turns)?;
+        let key_topics = analyzer.extract_topics(&turns)?;
+        let emotional_state = analyzer.analyze_emotions(&turns)?;
+        let last_topic = analyzer.extract_last_topic(&turns)?;
+
+        Ok(SessionAnalysis {
+            summary,
+            key_topics,
+            emotional_state,
+            last_topic,
+            turn_count: turns.len(),
+        })
+    }
 }
 
 /// Статистика менеджера диалогов
@@ -534,6 +578,148 @@ impl DialogueManagerStats {
     }
 }
 
+pub trait LlmPipeline: Send + Sync {
+    fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String>;
+}
+
+struct ContextAnalyzer<'a> {
+    pipeline: &'a dyn LlmPipeline,
+}
+
+impl<'a> ContextAnalyzer<'a> {
+    fn new(pipeline: &'a dyn LlmPipeline) -> Self {
+        Self { pipeline }
+    }
+
+    fn summarize_session(&self, turns: &[Turn]) -> Result<String> {
+        if turns.is_empty() {
+            return Ok(String::new());
+        }
+
+        let dialogue_text = turns
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("Turn {}:\nUser: {}\nAssistant: {}\n", i + 1, t.user, t.assistant))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            r#"<s>[INST] Ты — ассистент по анализу диалогов. Кратко опиши, о чём был разговор (2-3 предложения на русском).
+
+Диалог:
+{dialogue_text}
+
+Краткое содержание:[/INST]"#,
+            dialogue_text = dialogue_text
+        );
+
+        let response = self.pipeline.generate(&prompt, 300)?;
+        Ok(response.trim().to_string())
+    }
+
+    fn extract_topics(&self, turns: &[Turn]) -> Result<Vec<String>> {
+        if turns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let dialogue_text = turns
+            .iter()
+            .map(|t| format!("User: {}\nAssistant: {}", t.user, t.assistant))
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+
+        let prompt = format!(
+            r#"<s>[INST] Извлеки ключевые темы из диалога. Верни только JSON массив строк, например: ["тема1", "тема2", "тема3"].
+Не более 5 тем. Темы должны быть короткими (1-2 слова), на русском языке.
+
+Диалог:
+{dialogue_text}
+
+Темы:[/INST]"#,
+            dialogue_text = dialogue_text
+        );
+
+        let response = self.pipeline.generate(&prompt, 200)?;
+        self.parse_topics(&response)
+    }
+
+    fn parse_topics(&self, response: &str) -> Result<Vec<String>> {
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+
+        let topics: Result<Vec<String>, _> = serde_json::from_str(&cleaned);
+
+        match topics {
+            Ok(t) => Ok(t),
+            Err(_) => {
+                let without_brackets = cleaned.trim_start_matches('[').trim_end_matches(']');
+                let items: Result<Vec<String>, _> = serde_json::from_str(&format!("[{}]", without_brackets));
+                items.map_err(|e| anyhow::anyhow!("Failed to parse topics: {}", e))
+            }
+        }
+    }
+
+    fn analyze_emotions(&self, turns: &[Turn]) -> Result<f32> {
+        if turns.is_empty() {
+            return Ok(0.5);
+        }
+
+        let dialogue_text = turns
+            .iter()
+            .map(|t| format!("User: {}\nAssistant: {}", t.user, t.assistant))
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+
+        let prompt = format!(
+            r#"<s>[INST] Определи эмоциональное состояние пользователя по диалогу.
+ Верни только число от 0.0 (негативное/грустное) до 1.0 (позитивное/радостное).
+
+Диалог:
+{dialogue_text}
+
+Число:[/INST]"#,
+            dialogue_text = dialogue_text
+        );
+
+        let response = self.pipeline.generate(&prompt, 50)?;
+        let cleaned = response.trim();
+
+        cleaned
+            .parse::<f32>()
+            .map(|v| v.clamp(0.0, 1.0))
+            .map_err(|_| anyhow::anyhow!("Failed to parse emotional state"))
+    }
+
+    fn extract_last_topic(&self, turns: &[Turn]) -> Result<String> {
+        if let Some(last_turn) = turns.last() {
+            let prompt = format!(
+                r#"<s>[INST] Определи, о чём был последний вопрос пользователя (1-2 слова на русском).
+Вопрос: {question}
+
+Тема:[/INST]"#,
+                question = last_turn.user
+            );
+
+            let response = self.pipeline.generate(&prompt, 50)?;
+            return Ok(response.trim().to_string());
+        }
+        Ok(String::new())
+    }
+}
+
+pub struct SessionAnalysis {
+    pub summary: String,
+    pub key_topics: Vec<String>,
+    pub emotional_state: f32,
+    pub last_topic: String,
+    pub turn_count: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,12 +728,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dialogue_manager() -> Result<()> {
-        // Создаем тестовый эмбеддинг движок (заглушка)
-        // В реальном коде здесь будет настоящая модель
         let embedder = Arc::new(create_test_embedder()?);
         let mut manager = DialogueManager::new(embedder.clone(), "test_persona".to_string());
 
-        // Добавляем обмен
         manager
             .add_exchange(
                 "Hello, how are you?".to_string(),
@@ -555,11 +738,9 @@ mod tests {
             )
             .await?;
 
-        // Проверяем статистику
         let stats = manager.stats();
         assert_eq!(stats.current_session_turns, 1);
 
-        // Проверяем контекст
         let context = manager.get_current_context(5);
         assert!(context.contains("Hello, how are you?"));
         assert!(context.contains("I'm doing well, thank you!"));
@@ -568,8 +749,6 @@ mod tests {
     }
 
     fn create_test_embedder() -> Result<EmbeddingEngine> {
-        // В реальных тестах здесь будет настоящая модель
-        // Пока возвращаем ошибку для демонстрации
         Err(anyhow!("Test embedder not implemented"))
     }
 }

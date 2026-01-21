@@ -26,4 +26,5 @@ pub mod concept;
 pub mod manager;
 pub mod persistence;
 
+pub use concept::{Concept, ConceptCategory};
 pub use manager::{ConceptExtractor, ExtractionResult, SemanticMemoryManager};
