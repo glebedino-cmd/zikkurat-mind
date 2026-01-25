@@ -1,8 +1,8 @@
 [package]
-name = "mistral-pure"
-version = "0.1.0"
+name = "zikkurat-mind"
+version = "0.2.0"
 edition = "2021"
-description = "mistral-pure using Candle"
+description = "AI with hybrid memory, knowledge graph and digital persona"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

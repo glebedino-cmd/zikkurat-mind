@@ -26,5 +26,8 @@ pub mod concept;
 pub mod manager;
 pub mod persistence;
 
-pub use concept::{Concept, ConceptCategory};
+pub use concept::{
+    CategoryDecayStats, Concept, ConceptCategory, DecayConfig, DecayStats, GraphStats,
+    KnowledgeGraph, Triple,
+};
 pub use manager::{ConceptExtractor, ExtractionResult, SemanticMemoryManager};

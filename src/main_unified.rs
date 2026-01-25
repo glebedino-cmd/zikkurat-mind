@@ -30,6 +30,7 @@ use crate::totems::semantic::concept::ConceptCategory;
 use crate::totems::semantic::persistence::SemanticPersistenceManager;
 use crate::utils::hub_load_safetensors;
 use crate::demiurge::{Persona, ArchetypeLoader, persona::PersonaInfo};
+use chrono::Timelike;
 
 const DEFAULT_SAMPLE_LEN: usize = 2048;
 
@@ -505,6 +506,26 @@ struct Args {
     /// Maximum number of sessions to keep in memory
     #[arg(long, default_value_t = 50)]
     max_sessions: usize,
+
+    /// Apply temporal decay to semantic concepts
+    #[arg(long)]
+    apply_decay: bool,
+
+    /// Show decay statistics
+    #[arg(long)]
+    decay_stats: bool,
+
+    /// Show knowledge graph statistics
+    #[arg(long)]
+    graph_stats: bool,
+
+    /// Extract relations from text
+    #[arg(long)]
+    extract_relations: bool,
+
+    /// Find related concepts
+    #[arg(long)]
+    find_related: Option<String>,
 }
 
 const MAX_DIALOGUE_LENGTH: usize = 100;
@@ -728,6 +749,9 @@ fn process_query(
     persona: &mut Option<Persona>,
 ) -> Result<()> {
     log_memory_usage("process_query start");
+    
+    // Apply temporal decay if needed
+    apply_temporal_decay_if_needed(semantic_manager, args)?;
 
     // Detect if user uses formal or informal address
     let user_uses_formal = prompt.contains("Вы ") || prompt.contains("вы ") || prompt.contains("ВЫ ");
@@ -981,6 +1005,116 @@ fn resolve_path(path: &str) -> std::path::PathBuf {
         .join(path)
 }
 
+/// Применить temporal decay к семантической памяти
+fn apply_temporal_decay_if_needed(
+    semantic_manager: &Option<Arc<std::sync::Mutex<totems::semantic::SemanticMemoryManager>>>,
+    args: &Args,
+) -> Result<()> {
+    if !args.enable_semantic {
+        return Ok(());
+    }
+    
+    let now = chrono::Utc::now();
+    // Применяем decay раз в день в 3 часа ночи
+    let should_apply = now.hour() == 3 && now.minute() < 5;
+    
+    if should_apply {
+        if let Some(ref sm) = semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            match sm.apply_temporal_decay() {
+                Ok(updated_count) => {
+                    if updated_count > 0 {
+                        println!("🕰️ Applied temporal decay to {} concepts", updated_count);
+                    }
+                }
+                Err(e) => eprintln!("WARNING: Failed to apply temporal decay: {}", e),
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn handle_persona_command(input: &str, persona: &mut Option<Persona>) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let subcmd = parts.get(1).map(|s| *s).unwrap_or("show");
+
+    match subcmd {
+        "show" | "s" => {
+            if let Some(ref p) = *persona {
+                println!("\n🎭 Current Persona:");
+                println!("   Name: {}", p.name);
+                println!("   Archetype: {}", p.archetype_id);
+                println!("   Description: {}", p.description);
+                println!("   Style: {}", p.communication.style);
+                println!("   Greeting: {}", p.communication.greeting);
+            } else {
+                println!("No persona loaded.");
+            }
+        }
+        "traits" | "t" => {
+            if let Some(ref p) = *persona {
+                println!("\n📊 Persona Traits:");
+                for (trait_name, value) in p.get_all_traits() {
+                    let bar_len = (value * 20.0) as usize;
+                    let bar = "█".repeat(bar_len) + &"░".repeat(20 - bar_len);
+                    println!("   {:<15} [{}] {:.2}", trait_name, bar, value);
+                }
+            } else {
+                println!("No persona loaded.");
+            }
+        }
+        "evolution" | "e" => {
+            if let Some(ref p) = *persona {
+                println!("\n📈 Persona Evolution:");
+                println!("   Interactions: {}", p.evolution.interactions_count);
+                println!("   Successful helps: {}", p.evolution.successful_helps);
+                println!("   Relationship score: {:.2}", p.evolution.relationship_score);
+                println!("   Unlocked traits: {:?}", p.evolution.unlocked_traits);
+            } else {
+                println!("No persona loaded.");
+            }
+        }
+        "switch" => {
+            if let Some(archetype_name) = parts.get(2) {
+                match ArchetypeLoader::load(archetype_name) {
+                    Ok(archetype) => {
+                        let p = Persona::from_archetype(std::sync::Arc::new(archetype));
+                        println!("🎭 Switched to persona: {} ({})", p.name, p.archetype_id);
+                        *persona = Some(p);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load archetype '{}': {}", archetype_name, e);
+                        eprintln!("Available: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
+                    }
+                }
+            } else {
+                println!("Usage: /persona switch <archetype>");
+                println!("Available: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
+            }
+        }
+        "list" | "l" => {
+            println!("\n📋 Available Archetypes:");
+            match ArchetypeLoader::list_ids() {
+                Ok(ids) => {
+                    for id in ids {
+                        println!("   - {}", id);
+                    }
+                }
+                Err(e) => eprintln!("Error listing archetypes: {}", e),
+            }
+        }
+        _ => {
+            println!("Persona commands:");
+            println!("   /persona show      - Show current persona");
+            println!("   /persona traits    - Show persona traits");
+            println!("   /persona evolution - Show evolution stats");
+            println!("   /persona switch <name> - Switch archetype");
+            println!("   /persona list      - List available archetypes");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     
@@ -1054,13 +1188,98 @@ fn main() -> Result<()> {
     let mut semantic_manager: Option<std::sync::Arc<std::sync::Mutex<SemanticMemoryManager>>> = if args.enable_semantic {
         let storage_path = resolve_path("memory_data/semantic");
         let persistence = SemanticPersistenceManager::new(Some(&storage_path))?;
-        let sm = SemanticMemoryManager::new(embedder.clone(), persistence)?;
+        let mut sm = SemanticMemoryManager::new(embedder.clone(), persistence)?;
+
+        // Load knowledge graph if exists
+        if let Err(e) = sm.load_graph() {
+            eprintln!("WARNING: Failed to load knowledge graph: {}", e);
+        }
+
         Some(std::sync::Arc::new(std::sync::Mutex::new(sm)))
     } else {
         None
     };
     if args.enable_semantic {
         println!("🧠 Semantic memory enabled");
+    }
+
+    // Handle command-line semantic memory commands
+    if args.apply_decay {
+        if let Some(ref sm) = semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            match sm.apply_temporal_decay() {
+                Ok(updated_count) => {
+                    println!("🕰️ Applied temporal decay to {} concepts", updated_count);
+                }
+                Err(e) => eprintln!("ERROR: Failed to apply decay: {}", e),
+            }
+        }
+        return Ok(());
+    }
+
+    if args.decay_stats {
+        if let Some(ref sm) = semantic_manager {
+            let sm = sm.lock().unwrap();
+            let stats = sm.get_decay_stats();
+            println!("📊 Temporal Decay Statistics:");
+            println!("   Total concepts: {}", stats.total_concepts);
+            println!("   Decayed concepts: {}", stats.decayed_concepts);
+            println!("   Low confidence concepts: {}", stats.low_confidence_concepts);
+            println!();
+
+            for (category, cat_stats) in stats.category_stats {
+                println!("   {}: total={}, low_conf={}, avg_conf={:.2}",
+                         category, cat_stats.total, cat_stats.low_confidence, cat_stats.avg_confidence);
+            }
+        }
+        return Ok(());
+    }
+
+    if args.graph_stats {
+        if let Some(ref sm) = semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            let stats = sm.get_graph_stats();
+            println!("🕸️ Knowledge Graph Statistics:");
+            println!("   Total triples: {}", stats.total_triples);
+            println!("   Total predicates: {}", stats.total_predicates);
+            println!("   Average degree: {:.2}", stats.avg_degree);
+        }
+        return Ok(());
+    }
+
+    if args.extract_relations {
+        if let Some(ref sm) = semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            println!("📝 Enter text to extract relations from:");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let relations_added = sm.extract_relations_from_text(&input.trim(), "manual")?;
+            println!("✅ Extracted {} relations", relations_added);
+        }
+        return Ok(());
+    }
+
+    if let Some(ref concept_query) = args.find_related {
+        if let Some(ref sm) = semantic_manager {
+            let mut sm = sm.lock().unwrap();
+            // Find concept by text search
+            let concepts = sm.search_by_text(concept_query, 5);
+            if let Some((_, best_concept)) = concepts.first() {
+                let related = sm.find_related_concepts(&best_concept.id);
+                println!("🔗 Related concepts for '{}':", best_concept.text);
+                for (related_id, predicate, confidence) in related {
+                    if let Some(related_concept) = sm.get_concept(&related_id) {
+                        println!("   {} [{}] ({:.2})",
+                                 related_concept.text, predicate, confidence);
+                    }
+                }
+            } else {
+                println!("❌ No concepts found matching '{}'", concept_query);
+            }
+        } else {
+            println!("❌ Semantic memory not enabled");
+        }
+        return Ok(());
     }
 
     // Инициализируем Persona (Demiurge Level)
@@ -1285,6 +1504,7 @@ fn main() -> Result<()> {
         let dm_for_save = dialogue_manager.clone();
         let persistence_for_save = persistence_manager.clone();
         let embedder_for_save = embedder.clone();
+        let semantic_for_save = semantic_manager.clone();
 
         let _ = ctrlc::set_handler(move || {
             println!("\n\n💾 Saving context before exit...");
@@ -1303,6 +1523,16 @@ fn main() -> Result<()> {
                     eprintln!("WARNING: Failed to save memory: {}", e);
                 } else {
                     println!("💾 Episodic memory saved");
+                }
+            }
+
+            // Also save knowledge graph if enabled
+            if let Some(ref sm) = semantic_for_save {
+                let mut sm = sm.lock().unwrap();
+                if let Err(e) = sm.save_graph() {
+                    eprintln!("WARNING: Failed to save knowledge graph: {}", e);
+                } else {
+                    println!("🕸️ Knowledge graph saved");
                 }
             }
 
@@ -1385,12 +1615,14 @@ fn main() -> Result<()> {
                     println!("Semantic memory is disabled. Use --enable-semantic to enable.");
                     continue;
                 }
-                if let Some(ref sm) = semantic_manager {
-                    handle_semantic_command(input, sm);
-                } else {
-                    println!("Semantic memory not initialized.");
+                // Old semantic commands moved to main args - see --graph-stats, --extract-relations, --find-related
+                if input.starts_with("/semantic") {
+                    println!("📝 Semantic commands moved to CLI arguments:");
+                    println!("   --graph-stats        Show knowledge graph statistics");
+                    println!("   --extract-relations  Extract relations from text");
+                    println!("   --find-related <text> Find related concepts");
+                    continue;
                 }
-                continue;
             }
 
             if input == "/mem" || input == "/memory" {
@@ -1510,402 +1742,4 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn handle_semantic_command(input: &str, sm: &std::sync::Mutex<totems::semantic::SemanticMemoryManager>) {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let command = parts.get(1).map(|s| *s).unwrap_or("");
-
-    match command {
-        "help" | "h" => {
-            println!(r#"
- 📚 Semantic Memory Commands:
-   /semantic help           - Show this help
-   /semantic list [n]       - List concepts (default: 10)
-   /semantic list <category> [n] - List concepts by category (facts|rules|preferences|skills|general)
-   /semantic stats          - Show statistics
-   /semantic search <query> - Search concepts
-   /semantic add "<text>" <category> [confidence] - Add new concept
-   /semantic vote <id> <up|down> - Vote to adjust concept confidence
-   /semantic delete <id>    - Delete concept by ID
-   /semantic merge          - Merge duplicate concepts
-   /semantic get <id>       - Show concept by ID
-   Short form: /s instead of /semantic
-"#);
-        }
-
-        "list" | "l" => {
-            let sm = sm.lock().unwrap();
-            if parts.len() >= 3 {
-                let cat_arg = parts[2].to_lowercase();
-                match cat_arg.as_str() {
-                    "facts" | "rules" | "preferences" | "pref" | "skills" | "general" => {
-                        let cat = match cat_arg.as_str() {
-                            "facts" => ConceptCategory::Facts,
-                            "rules" => ConceptCategory::Rules,
-                            "preferences" | "pref" => ConceptCategory::Preferences,
-                            "skills" => ConceptCategory::Skills,
-                            "general" => ConceptCategory::General,
-                            _ => unreachable!()
-                        };
-                        let limit = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
-                        let concepts = sm.list_by_category(&cat, limit);
-                        let total_in_cat = sm.get_concepts_by_category(&cat).len();
-                        if concepts.is_empty() {
-                            println!("No concepts found in category '{}'.", cat);
-                        } else {
-                            println!("📚 Concepts in {} (showing {} of {}):", cat, concepts.len(), total_in_cat);
-                            for (i, c) in concepts.iter().enumerate() {
-                                println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
-                            }
-                        }
-                        return;
-                    }
-                    _ => {
-                        let limit = parts.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
-                        let concepts = sm.list_concepts(limit, 0);
-                        if concepts.is_empty() {
-                            println!("No concepts found.");
-                        } else {
-                            println!("📚 Concepts (showing {} of {}):", concepts.len(), sm.count());
-                            for (i, c) in concepts.iter().enumerate() {
-                                println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
-                            }
-                        }
-                    }
-                };
-            } else {
-                let limit = parts.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
-                let concepts = sm.list_concepts(limit, 0);
-                if concepts.is_empty() {
-                    println!("No concepts found.");
-                } else {
-                    println!("📚 Concepts (showing {} of {}):", concepts.len(), sm.count());
-                    for (i, c) in concepts.iter().enumerate() {
-                        println!("{}. [{}] {} (conf: {:.2})", i + 1, c.category, truncate_text(&c.text, 60), c.confidence);
-                    }
-                }
-            }
-        }
-
-        "stats" | "st" => {
-            let sm = sm.lock().unwrap();
-            println!("{}", sm.stats_pretty());
-        }
-
-        "search" | "s" => {
-            if parts.len() < 3 {
-                println!("Usage: /semantic search <query>");
-                return;
-            }
-            let query = parts[2..].join(" ");
-            let sm = sm.lock().unwrap();
-            println!("{}", sm.search_pretty(&query, 10));
-        }
-
-        "add" | "a" => {
-            if parts.len() < 4 {
-                println!(r#"Usage: /semantic add "<text>" <category> [confidence]
-Categories: facts, rules, preferences, skills"#);
-                return;
-            }
-            let mut text = parts[2].to_string();
-            let mut idx = 3;
-            if text.starts_with('"') {
-                text = text.trim_start_matches('"').to_string();
-                while idx < parts.len() && !parts[idx].ends_with('"') {
-                    text.push(' ');
-                    text.push_str(parts[idx]);
-                    idx += 1;
-                }
-                if idx < parts.len() {
-                    text.push(' ');
-                    text.push_str(parts[idx].trim_end_matches('"'));
-                    idx += 1;
-                }
-            }
-            if idx >= parts.len() {
-                println!(r#"Usage: /semantic add "<text>" <category> [confidence]"#);
-                return;
-            }
-            let category = parts[idx];
-            idx += 1;
-            let confidence = parts.get(idx).and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.5);
-
-            let cat = match category {
-                "facts" => ConceptCategory::Facts,
-                "rules" => ConceptCategory::Rules,
-                "preferences" | "pref" => ConceptCategory::Preferences,
-                "skills" => ConceptCategory::Skills,
-                _ => {
-                    println!("Unknown category: {}. Use: facts, rules, preferences, skills", category);
-                    return;
-                }
-            };
-
-            let mut sm = sm.lock().unwrap();
-            match sm.add_concept(text.to_string(), cat, "manual".to_string(), Some(confidence)) {
-                Ok(c) => println!("✅ Added concept: {} ({})", c.id, c.category),
-                Err(e) => println!("❌ Error: {}", e),
-            }
-        }
-
-        "delete" | "del" | "remove" | "rm" => {
-            if parts.len() < 3 {
-                println!("Usage: /semantic delete <id>");
-                return;
-            }
-            let id = parts[2];
-            let mut sm = sm.lock().unwrap();
-            if let Ok(uuid) = uuid::Uuid::parse_str(id) {
-                if sm.remove_concept(uuid) {
-                    println!("✅ Deleted concept: {}", id);
-                } else {
-                    println!("❌ Concept not found: {}", id);
-                }
-            } else {
-                println!("Invalid UUID: {}", id);
-            }
-        }
-
-        "merge" => {
-            let mut sm = sm.lock().unwrap();
-            match sm.merge_similar(0.8) {
-                Ok(count) => println!("✅ Merged {} duplicate concepts", count),
-                Err(e) => println!("❌ Error: {}", e),
-            }
-        }
-
-        "get" => {
-            if parts.len() < 3 {
-                println!("Usage: /semantic get <id>");
-                return;
-            }
-            let sm = sm.lock().unwrap();
-            if let Some(c) = sm.get_concept_by_id(parts[2]) {
-                println!("{}", sm.format_concept(c));
-            } else {
-                println!("Concept not found: {}", parts[2]);
-            }
-        }
-
-        "vote" | "v" => {
-            if parts.len() < 4 {
-                println!(r#"Usage: /semantic vote <id> <up|down>
-  /semantic vote <id> up   - Increase confidence by 0.1
-  /semantic vote <id> down - Decrease confidence by 0.1"#);
-                return;
-            }
-            let id = parts[2];
-            let direction = parts[3].to_lowercase();
-            let delta = match direction.as_str() {
-                "up" | "u" | "+" => 0.1,
-                "down" | "d" | "-" => -0.1,
-                _ => {
-                    println!("Invalid vote direction: {}. Use 'up' or 'down'", parts[3]);
-                    return;
-                }
-            };
-            let mut sm = sm.lock().unwrap();
-            if let Ok(uuid) = uuid::Uuid::parse_str(id) {
-                if let Err(e) = sm.update_concept_confidence(uuid, delta) {
-                    println!("❌ Error: {}", e);
-                } else {
-                    if let Some(c) = sm.get_concept(uuid) {
-                        println!("✅ Voted {} on concept: confidence = {:.2}", if delta > 0.0 { "UP" } else { "DOWN" }, c.confidence);
-                    }
-                }
-            } else {
-                println!("Invalid UUID: {}", id);
-            }
-        }
-
-        "" => {
-            let sm = sm.lock().unwrap();
-            println!("📚 Semantic memory: {} concepts", sm.count());
-        }
-
-        _ => {
-            println!("Unknown command: {}. Use /semantic help", command);
-        }
-    }
-}
-
-fn handle_persona_command(input: &str, persona: &mut Option<Persona>) {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let command = parts.get(1).map(|s| *s).unwrap_or("");
-
-    match command {
-        "help" | "h" => {
-            println!(r#"
-🎭 Persona Commands:
-   /persona help           - Show this help
-   /persona show           - Show current persona info
-   /persona list           - List available archetypes
-   /persona switch <name>  - Switch to another archetype
-   /persona traits         - Show current traits
-   /persona evolution      - Show evolution status
-   Short form: /p instead of /persona
-"#);
-        }
-
-        "list" | "l" => {
-            match ArchetypeLoader::list_ids() {
-                Ok(ids) => {
-                    if ids.is_empty() {
-                        println!("No archetypes found in config/archetypes/");
-                    } else {
-                        println!("🎭 Available archetypes:");
-                        for id in ids {
-                            println!("  - {}", id);
-                        }
-                    }
-                }
-                Err(e) => println!("Error loading archetypes: {}", e),
-            }
-        }
-
-        "show" | "" => {
-            if let Some(ref p) = persona {
-                let info: PersonaInfo = p.into();
-                println!("\n🎭 Current Persona:");
-                println!("   Name: {}", info.name);
-                println!("   Archetype: {}", info.archetype_id);
-                println!("   Description: {}", info.description);
-                println!("   Interactions: {}", info.evolution.interactions);
-                println!("   Relationship score: {:.2}", info.evolution.relationship_score);
-            } else {
-                println!("No persona loaded. Use --archetype in CLI args to enable.");
-            }
-        }
-
-        "switch" | "s" => {
-            if parts.len() < 3 {
-                println!("Usage: /persona switch <archetype>");
-                println!("Available archetypes: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
-                return;
-            }
-            let new_archetype = parts[2];
-            match ArchetypeLoader::load(new_archetype) {
-                Ok(archetype) => {
-                    let new_persona = Persona::from_archetype(std::sync::Arc::new(archetype));
-                    println!("✅ Switched to persona: {} ({})", new_persona.name, new_persona.archetype_id);
-                    *persona = Some(new_persona);
-                }
-                Err(e) => {
-                    println!("❌ Error loading archetype '{}': {}", new_archetype, e);
-                    println!("Available archetypes: {:?}", ArchetypeLoader::list_ids().unwrap_or_default());
-                }
-            }
-        }
-
-        "traits" | "t" => {
-            if let Some(ref p) = persona {
-                let traits = p.get_all_traits();
-                println!("\n📊 Current Traits:");
-                println!("┌─────────────────────┬────────┬─────────────┐");
-                println!("│ Trait               │ Value  │ Description │");
-                println!("├─────────────────────┼────────┼─────────────┤");
-                let mut trait_names: Vec<_> = traits.keys().collect();
-                trait_names.sort();
-                for name in trait_names {
-                    let value = traits[name];
-                    let bar = get_trait_bar(value);
-                    let desc = get_trait_description(name, value);
-                    println!("│ {:<19} │ {} │ {} │", name, bar, desc);
-                }
-                println!("└─────────────────────┴────────┴─────────────┘");
-            } else {
-                println!("No persona loaded.");
-            }
-        }
-
-        "evolution" | "e" | "unlocks" | "u" => {
-            if let Some(ref p) = persona {
-                let info: PersonaInfo = p.into();
-                println!("\n🌱 Evolution Status:");
-                println!("   Interactions: {}", info.evolution.interactions);
-                println!("   Relationship score: {:.2}", info.evolution.relationship_score);
-
-                if info.evolution.unlocked_traits.is_empty() {
-                    println!("   Unlocked traits: None (keep interacting to unlock!)");
-                } else {
-                    println!("   Unlocked traits: {:?}", info.evolution.unlocked_traits);
-                }
-
-                println!("\n📈 Relationship Arc:");
-                if info.evolution.relationship_score > 0.8 {
-                    println!("   💕 Deep connection established");
-                } else if info.evolution.relationship_score > 0.6 {
-                    println!("   🤝 Good working relationship");
-                } else if info.evolution.relationship_score > 0.4 {
-                    println!("   👋 Normal interaction");
-                } else {
-                    println!("   🆕 Just getting started");
-                }
-            } else {
-                println!("No persona loaded.");
-            }
-        }
-
-        _ => {
-            println!("Unknown command: {}. Use /persona help", command);
-        }
-    }
-}
-
-fn get_trait_bar(value: f32) -> String {
-    let filled = (value * 10.0) as usize;
-    let empty = 10 - filled;
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
-}
-
-fn get_trait_description(name: &str, value: f32) -> &'static str {
-    match name {
-        "analytical" if value > 0.8 => "Analytical",
-        "analytical" if value > 0.6 => "Logical",
-        "analytical" => "Balanced",
-
-        "empathy" if value > 0.8 => "Very Empathetic",
-        "empathy" if value > 0.6 => "Understanding",
-        "empathy" => "Neutral",
-
-        "humor" if value > 0.7 => "Playful",
-        "humor" if value > 0.5 => "Light",
-        "humor" => "Serious",
-
-        "pedagogical" if value > 0.7 => "Teacher-like",
-        "pedagogical" if value > 0.5 => "Helpful",
-        "pedagogical" => "Direct",
-
-        "technical" if value > 0.8 => "Expert",
-        "technical" if value > 0.6 => "Skilled",
-        "technical" => "Generalist",
-
-        "supportive" if value > 0.8 => "Very Supportive",
-        "supportive" if value > 0.6 => "Encouraging",
-        "supportive" => "Neutral",
-
-        "creative" if value > 0.7 => "Creative",
-        "creative" if value > 0.5 => "Inventive",
-        "creative" => "Practical",
-
-        "patient" if value > 0.8 => "Very Patient",
-        "patient" if value > 0.6 => "Calm",
-        "patient" => "Energetic",
-
-        "curious" if value > 0.8 => "Very Curious",
-        "curious" if value > 0.6 => "Inquisitive",
-        "curious" => "Focused",
-
-        "skeptical" if value > 0.7 => "Critical",
-        "skeptical" if value > 0.5 => "Questioning",
-        "skeptical" => "Trusting",
-
-        "formal" if value > 0.7 => "Formal",
-        "formal" if value > 0.4 => "Semi-formal",
-        "formal" => "Casual",
-
-        _ => "Balanced",
-    }
 }

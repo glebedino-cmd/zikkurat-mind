@@ -171,6 +171,7 @@ impl SemanticPersistenceManager {
             created_at: serialized.created_at,
             updated_at: serialized.updated_at,
             usage_count: serialized.usage_count,
+            related_concepts: Vec::new(),
         })
     }
 }

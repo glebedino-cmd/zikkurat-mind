@@ -1883,35 +1883,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mistral-pure"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "chrono",
- "clap",
- "ctrlc",
- "hf-hub",
- "image",
- "lru",
- "lz4",
- "memmap2",
- "num_cpus",
- "parking_lot",
- "regex",
- "serde",
- "serde_json",
- "tokenizers",
- "tracing",
- "tracing-chrome",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4251,6 +4222,35 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zikkurat-mind"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "chrono",
+ "clap",
+ "ctrlc",
+ "hf-hub",
+ "image",
+ "lru",
+ "lz4",
+ "memmap2",
+ "num_cpus",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tracing",
+ "tracing-chrome",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
