@@ -20,6 +20,8 @@ pub enum ConceptCategory {
     Preferences,
     /// Навыки и способности
     Skills,
+    /// Цели и мечты
+    Goals,
     /// Общие знания
     General,
 }
@@ -31,6 +33,7 @@ impl std::fmt::Display for ConceptCategory {
             ConceptCategory::Rules => write!(f, "rules"),
             ConceptCategory::Preferences => write!(f, "preferences"),
             ConceptCategory::Skills => write!(f, "skills"),
+            ConceptCategory::Goals => write!(f, "goals"),
             ConceptCategory::General => write!(f, "general"),
         }
     }
@@ -44,6 +47,7 @@ impl std::str::FromStr for ConceptCategory {
             "rules" => Ok(ConceptCategory::Rules),
             "preferences" => Ok(ConceptCategory::Preferences),
             "skills" => Ok(ConceptCategory::Skills),
+            "goals" => Ok(ConceptCategory::Goals),
             "general" => Ok(ConceptCategory::General),
             _ => Err(format!("Unknown category: {}", s)),
         }
@@ -59,6 +63,7 @@ impl PartialEq for ConceptCategory {
             (ConceptCategory::Rules, ConceptCategory::Rules) => true,
             (ConceptCategory::Preferences, ConceptCategory::Preferences) => true,
             (ConceptCategory::Skills, ConceptCategory::Skills) => true,
+            (ConceptCategory::Goals, ConceptCategory::Goals) => true,
             (ConceptCategory::General, ConceptCategory::General) => true,
             _ => false,
         }
@@ -72,6 +77,7 @@ impl Hash for ConceptCategory {
             ConceptCategory::Rules => 1u8.hash(state),
             ConceptCategory::Preferences => 2u8.hash(state),
             ConceptCategory::Skills => 3u8.hash(state),
+            ConceptCategory::Goals => 5u8.hash(state),
             ConceptCategory::General => 4u8.hash(state),
         }
     }

@@ -5,6 +5,7 @@
 //! communication styles, and evolving narratives.
 
 pub mod archetype;
+pub mod context;
 pub mod directives;
 pub mod evolution;
 pub mod narrative;
@@ -13,9 +14,10 @@ pub mod persona;
 pub use archetype::{
     Archetype, ArchetypeDirective, ArchetypeLoader, BaseTraits, CommunicationStyle,
 };
+pub use context::{ContextStorage, PersonaSessionContext, Preference};
 pub use directives::Directive;
 pub use evolution::{EvolutionState, Interaction};
-pub use narrative::{ContextStorage, NarrativeSystem, PersonaSessionContext};
+pub use narrative::NarrativeManager;
 pub use persona::Persona;
 
 use anyhow::Result;

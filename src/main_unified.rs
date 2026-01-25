@@ -16,8 +16,10 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::mistral::{Config, Model as Mistral};
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use regex::Regex;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokenizers::Tokenizer;
 
 use crate::priests::device::select_device;
@@ -30,6 +32,106 @@ use crate::utils::hub_load_safetensors;
 use crate::demiurge::{Persona, ArchetypeLoader, persona::PersonaInfo};
 
 const DEFAULT_SAMPLE_LEN: usize = 2048;
+
+// Global verbose flag for debug output
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+fn regex_fallback_extract(text: &str) -> totems::semantic::ExtractionResult {
+    let mut results = totems::semantic::ExtractionResult::new();
+
+    debug_log!("DEBUG [regex_fallback]: processing '{}'", text);
+
+    let patterns = vec![
+        (r#"(?i)я\s+люблю\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)я\s+не\s+люблю\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)мне\s+нравится\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)мне\s+не\s+нравится\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)я\s+предпочитаю\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)я\s+ненавижу\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)мой\s+(?:любимый|любимая|любимое)\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)i\s+love\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)i\s+don't\s+love\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)i\s+like\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)i\s+prefer\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)i\s+hate\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)my\s+favorite\s+(.+)"#, "preferences", 0.8),
+        (r#"(?i)я\s+хочу\s+(.+)"#, "goals", 0.7),
+        (r#"(?i)я\s+мечтаю\s+(.+)"#, "goals", 0.7),
+        (r#"(?i)я\s+планирую\s+(.+)"#, "goals", 0.7),
+        (r#"(?i)моя\s+цель\s+(.+)"#, "goals", 0.8),
+        (r#"(?i)моя\s+мечта\s+(.+)"#, "goals", 0.8),
+        (r#"(?i)i\s+want\s+(.+)"#, "goals", 0.7),
+        (r#"(?i)i\s+dream\s+(.+)"#, "goals", 0.7),
+        (r#"(?i)i\s+plan\s+(.+)"#, "goals", 0.7),
+        (r#"(?i)my\s+goal\s+(.+)"#, "goals", 0.8),
+        (r#"(?i)my\s+dream\s+(.+)"#, "goals", 0.8),
+        (r#"(?i)я\s+работаю\s+(.+)"#, "facts", 0.7),
+        (r#"(?i)я\s+знаю\s+(.+)"#, "skills", 0.7),
+        (r#"(?i)i\s+work\s+(.+)"#, "facts", 0.7),
+        (r#"(?i)i\s+know\s+(.+)"#, "skills", 0.7),
+    ];
+
+    for (pattern, category, confidence) in &patterns {
+        if pattern.contains("хочу") {
+            debug_log!("DEBUG [regex_fallback]: TESTING 'хочу' pattern: '{}' on '{}'", pattern, text);
+        }
+        if let Ok(re) = Regex::new(pattern) {
+            if let Some(cap) = re.captures(text) {
+                if let Some(m) = cap.get(1) {
+                    let extracted = m.as_str().trim().to_string();
+                    if !extracted.is_empty() && extracted.len() > 2 {
+                        debug_log!("DEBUG [regex_fallback]: MATCHED '{}' -> '{}'", pattern, extracted);
+                        results.push((format!("I {}", extract_english_pattern(pattern, &extracted)), category.to_string(), *confidence));
+                    } else if pattern.contains("хочу") {
+                        debug_log!("DEBUG [regex_fallback]: MATCHED '{}' but extracted empty or too short", pattern);
+                    }
+                } else if pattern.contains("хочу") {
+                    debug_log!("DEBUG [regex_fallback]: MATCHED '{}' but no capture group 1", pattern);
+                }
+            } else if pattern.contains("хочу") {
+                debug_log!("DEBUG [regex_fallback]: NO MATCH '{}' on '{}'", pattern, text);
+            }
+        } else if pattern.contains("хочу") {
+            debug_log!("DEBUG [regex_fallback]: REGEX ERROR for '{}'", pattern);
+        }
+    }
+
+    debug_log!("DEBUG [regex_fallback]: found {} results", results.len());
+    for (i, (text, cat, conf)) in results.iter().enumerate() {
+        debug_log!("DEBUG [regex_fallback]: result {}: '{}' ({}, {:.2})", i, text, cat, conf);
+    }
+    results
+}
+
+fn extract_english_pattern(pattern: &str, russian: &str) -> String {
+    if pattern.contains("люблю") || pattern.contains("love") {
+        format!("love {}", russian)
+    } else if pattern.contains("нравится") || pattern.contains("like") {
+        format!("like {}", russian)
+    } else if pattern.contains("предпочитаю") || pattern.contains("prefer") {
+        format!("prefer {}", russian)
+    } else if pattern.contains("ненавижу") || pattern.contains("hate") {
+        format!("hate {}", russian)
+    } else if pattern.contains("хочу") || pattern.contains("want") {
+        format!("want to {}", russian)
+    } else if pattern.contains("мечта") || pattern.contains("dream") {
+        format!("dream of {}", russian)
+    } else if pattern.contains("планиру") || pattern.contains("plan") {
+        format!("plan to {}", russian)
+    } else if pattern.contains("цель") || pattern.contains("goal") {
+        format!("goal: {}", russian)
+    } else {
+        russian.to_string()
+    }
+}
 
 struct ConceptExtractorImpl {
     pipeline: std::sync::Arc<std::sync::Mutex<UnifiedPipeline>>,
@@ -121,7 +223,8 @@ NO markdown, NO explanations, NO text before or after. Only JSON.
                 match parse_json(&fixed) {
                     Ok(c) => c,
                     Err(_) => {
-                        return Ok(Vec::new());
+                        debug_log!("DEBUG: JSON parsing failed, using regex fallback on user query");
+                        return Ok(regex_fallback_extract(user_query));
                     }
                 }
             }
@@ -367,6 +470,10 @@ struct Args {
     #[arg(long, short = 'q')]
     quiet: bool,
 
+    /// Enable verbose/debug output
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
     /// Number of similar dialogues to retrieve
     #[arg(long, default_value_t = 5)]
     memory_top_k: usize,
@@ -507,7 +614,7 @@ fn build_prompt_with_context(
 
     // Add relationship context if persona is available
     if let Some(p) = persona {
-        let relationship_summary = p.narrative.format_relationship_summary("default_user");
+        let relationship_summary = crate::demiurge::narrative::format_relationship_summary(&p.narrative.narrative, "default_user");
         if !relationship_summary.is_empty() {
             context_parts.push(format!("RELATIONSHIP:\n{}", relationship_summary));
         }
@@ -740,7 +847,7 @@ fn process_query(
     );
 
     if !args.quiet {
-        eprintln!("DEBUG: Enhanced prompt length: {}", enhanced_prompt.len());
+        debug_log!("DEBUG: Enhanced prompt length: {}", enhanced_prompt.len());
     }
 
     println!("\n📝 You: {}", prompt);
@@ -809,11 +916,11 @@ fn process_query(
             if has_self_disclosure {
                 if let Err(e) = sm.extract_from_dialogue(prompt, &response, &session_id) {
                     if !args.quiet {
-                        eprintln!("DEBUG: Failed to extract concepts: {}", e);
+                        debug_log!("DEBUG: Failed to extract concepts: {}", e);
                     }
                 }
                 if !args.quiet {
-                    eprintln!("DEBUG: Semantic memory now has {} concepts", sm.count());
+                    debug_log!("DEBUG: Semantic memory now has {} concepts", sm.count());
                 }
             }
         }
@@ -876,6 +983,9 @@ fn resolve_path(path: &str) -> std::path::PathBuf {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    
+    // Set global verbose flag for debug output
+    VERBOSE.store(args.verbose, Ordering::Relaxed);
 
     println!("🏛️ ZIGGURAT MIND - Initializing...");
 
@@ -920,9 +1030,26 @@ fn main() -> Result<()> {
     let mut dialogue_manager: Option<DialogueManager> = None;
     if args.enable_memory {
         let persona_name = args.archetype.clone();
-        dialogue_manager = Some(DialogueManager::new(embedder.clone(), persona_name));
+        
+        // Try to load saved episodic memory from previous sessions
+        match persistence_manager.load_with_embeddings(embedder.clone(), persona_name.clone()) {
+            Ok(Some((loaded_manager, _sessions))) => {
+                let session_count = loaded_manager.session_history().len();
+                println!("📚 Loaded episodic memory: {} sessions", session_count);
+                dialogue_manager = Some(loaded_manager);
+            }
+            Ok(None) => {
+                println!("📚 No saved episodic memory found, starting fresh");
+                dialogue_manager = Some(DialogueManager::new(embedder.clone(), persona_name));
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to load episodic memory: {}", e);
+                dialogue_manager = Some(DialogueManager::new(embedder.clone(), persona_name));
+            }
+        }
         println!("🗣️ Dialogue memory enabled");
     }
+
 
     let mut semantic_manager: Option<std::sync::Arc<std::sync::Mutex<SemanticMemoryManager>>> = if args.enable_semantic {
         let storage_path = resolve_path("memory_data/semantic");
@@ -1025,7 +1152,7 @@ fn main() -> Result<()> {
         let mut filenames: Vec<_> = unique_files.into_iter().collect();
         filenames.sort();
 
-        eprintln!(
+        debug_log!(
             "DEBUG: Found {} weight files: {:?}",
             filenames.len(),
             filenames
@@ -1088,7 +1215,7 @@ fn main() -> Result<()> {
         );
     }
 
-    eprintln!(
+    debug_log!(
         "DEBUG: Config loaded - hidden_size: {}, num_heads: {}, num_layers: {}",
         config.hidden_size, config.num_attention_heads, config.num_hidden_layers
     );
@@ -1182,7 +1309,7 @@ fn main() -> Result<()> {
             std::process::exit(0);
         });
 
-        println!("\n🗣️ Interactive mode - type 'quit' to exit");
+        println!("\n🗣️ Interactive mode - type 'quit'/'выход' to exit");
         println!("   /semantic - Manage semantic memory");
         println!("   /persona  - Manage persona (show, switch, traits, evolution)");
         println!("   /mem - Show memory usage");
@@ -1214,7 +1341,9 @@ fn main() -> Result<()> {
             if input.is_empty() {
                 continue;
             }
-            if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
+            // Support English and Russian exit commands
+            let exit_commands = ["quit", "exit", "q", "выход", "выйти", "пока"];
+            if exit_commands.iter().any(|&cmd| input.eq_ignore_ascii_case(cmd) || input == cmd) {
                 println!("💾 Saving session context...");
 
                 if let Some(ref p) = persona {
@@ -1366,10 +1495,16 @@ fn main() -> Result<()> {
             }
         }
         if let Some(ref sm) = semantic_manager {
-            let sm = sm.lock().unwrap();
-            let count = sm.count();
-            if count > 0 {
-                println!("📚 Semantic memory: {} concepts saved", count);
+            let mut sm = sm.lock().unwrap();
+            if let Err(e) = sm.save() {
+                eprintln!("WARNING: Failed to save semantic memory: {}", e);
+            } else {
+                let count = sm.count();
+                if count > 0 {
+                    println!("📚 Semantic memory: {} concepts saved", count);
+                } else {
+                    println!("ℹ️  No new semantic concepts to save");
+                }
             }
         }
     }

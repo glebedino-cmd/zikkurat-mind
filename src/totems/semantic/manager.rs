@@ -188,16 +188,22 @@ impl SemanticMemoryManager {
         source: String,
         confidence: Option<f32>,
     ) -> Result<Concept> {
-        let embedding = self.embedder.embed(&text)?;
+        let cleaned_text = text
+            .trim()
+            .replace("  ", " ")
+            .replace(" .", ".")
+            .replace(" ,", ",");
 
-        let normalized_text = text.to_lowercase();
+        let embedding = self.embedder.embed(&cleaned_text)?;
+
+        let normalized_text = cleaned_text.to_lowercase();
 
         for existing in self.concepts.values() {
             let existing_normalized = existing.text.to_lowercase();
 
             let text_similarity = cosine_similarity(&embedding, &existing.embedding);
 
-            if text_similarity > 0.92 {
+            if text_similarity > 0.95 {
                 if normalized_text == existing_normalized {
                     eprintln!(
                         "DEBUG: Duplicate concept found '{}' (similarity: {:.2}), skipping",
@@ -507,9 +513,13 @@ impl SemanticMemoryManager {
         self.save().ok();
     }
 
-    fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         let concepts: Vec<Concept> = self.concepts.values().cloned().collect();
         self.persistence.save(&concepts)
+    }
+
+    pub fn persist(&mut self) -> Result<()> {
+        self.save()
     }
 
     pub fn list_concepts(&self, limit: usize, offset: usize) -> Vec<&Concept> {

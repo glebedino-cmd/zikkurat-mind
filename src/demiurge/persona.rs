@@ -5,13 +5,14 @@
 
 use crate::demiurge::{
     Archetype, ArchetypeDirective, BaseTraits, CommunicationStyle, ContextStorage, Directive,
-    EvolutionState, NarrativeSystem, PersonaSessionContext,
+    EvolutionState, NarrativeManager, PersonaSessionContext,
 };
 use crate::totems::episodic::{DialogueManager, LlmPipeline};
 use crate::totems::semantic::{ConceptCategory, SemanticMemoryManager};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,7 +27,7 @@ pub struct Persona {
     pub base_traits: HashMap<String, f32>,
     pub communication: CommunicationStyle,
     pub directives: Vec<Directive>,
-    pub narrative: NarrativeSystem,
+    pub narrative: NarrativeManager,
     pub evolution: EvolutionState,
     pub semantic_manager: Option<Arc<Mutex<SemanticMemoryManager>>>,
 }
@@ -44,7 +45,7 @@ impl Persona {
             base_traits: traits,
             communication: archetype.communication.clone(),
             directives,
-            narrative: NarrativeSystem::new(&archetype.id),
+            narrative: NarrativeManager::new(&archetype.id),
             evolution: EvolutionState::default(),
             semantic_manager: None,
         }
@@ -282,13 +283,14 @@ impl Persona {
     }
 
     /// Save narrative to disk
-    pub fn save_narrative(&self) -> std::io::Result<()> {
-        self.narrative.save(&self.archetype_id)
+    pub fn save_narrative(&self) -> Result<()> {
+        let mut narrative = self.narrative.clone();
+        narrative.save()
     }
 
     /// Load narrative from disk
-    pub fn load_narrative(&mut self) -> anyhow::Result<()> {
-        self.narrative.load(&self.archetype_id)
+    pub fn load_narrative(&mut self) -> Result<()> {
+        self.narrative.load()
     }
 
     pub fn load_session_context(&mut self) -> Result<Option<PersonaSessionContext>> {
@@ -297,7 +299,7 @@ impl Persona {
             return Ok(None);
         }
 
-        ContextStorage::load(&self.archetype_id)
+        Ok(ContextStorage::load(&self.archetype_id)?)
     }
 
     pub fn save_session_context<D: LlmPipeline>(
@@ -320,7 +322,7 @@ impl Persona {
 
         let previous_session_id = dialogue_manager.current_session().id.to_string();
 
-        let mut context = PersonaSessionContext::new(&self.archetype_id);
+        let mut context = PersonaSessionContext::new(&self.archetype_id.clone());
         context.previous_session_id = previous_session_id;
         context.last_interaction_date = now;
         context.summary = analysis.summary;

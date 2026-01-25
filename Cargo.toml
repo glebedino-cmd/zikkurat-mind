@@ -31,6 +31,7 @@ lru = "0.12"                        # LRU кэш для GPU
 num_cpus = "1.16"                     # Детекция CPU ядер
 lz4 = "1.24"                        # Быстрое сжатие
 memmap2 = "0.9"                     # Memory mapped files для больших данных
+regex = "1.10"                      # Regex fallback для экстракции
 
 # Tracing (for --tracing flag)
 tracing = "0.1"
